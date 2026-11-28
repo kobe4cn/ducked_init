@@ -145,6 +145,19 @@ describe('需求评测跑分', () => {
     expect(JSON.stringify(r)).not.toContain(PROVIDER.apiKey);
   });
 
+  it('期望做不到的指标样例：模型回空 spec 加 unsupported（含平铺、顶层只有 unsupported）算通过，不再失败于模型调用', async () => {
+    const c = caseNamed('churn-forecast');
+    for (const reply of [
+      { spec: {}, items: [], unknowns: [], unsupported: ['预测流失概率'] },
+      { unsupported: ['预测流失概率'] },
+    ]) {
+      fakeLlm(setLlmFetch, () => json(reply));
+      expect(await runCase(PROVIDER, c)).toEqual({
+        id: 'churn-forecast', kind: 'metric', expectedUnsupported: true, valid: true, unsupported: ['预测流失概率'], structure: {}, hits: 0, items: 0, hitRate: 1,
+      });
+    }
+  });
+
   it('普通样例上模型回 unsupported：失败于「模型判断做不到」并带原因，不再报定义校验不过', async () => {
     const tag = caseNamed('spend-tier');
     fakeLlm(setLlmFetch, () => json({ unsupported: ['没有消费金额指标', '分档口径不明'] }));
@@ -158,6 +171,12 @@ describe('需求评测跑分', () => {
     fakeLlm(setLlmFetch, () => json({ spec: metric.expected, items: [], unknowns: [], unsupported: ['按城市不行'] }));
     expect(await runCase(PROVIDER, metric)).toMatchObject({
       valid: false, hits: 6, items: 6, failed: { stage: 'unsupported', message: '模型判断做不到：按城市不行' },
+    });
+
+    // 指标 spec 为空对象、只有 unsupported（整条做不到，#1323）：同样记 unsupported 带原因，不再失败于模型调用
+    fakeLlm(setLlmFetch, () => json({ spec: {}, items: [], unknowns: [], unsupported: ['目录里没有能算的'] }));
+    expect(await runCase(PROVIDER, metric)).toMatchObject({
+      valid: false, unsupported: ['目录里没有能算的'], failed: { stage: 'unsupported', message: '模型判断做不到：目录里没有能算的' },
     });
   });
 

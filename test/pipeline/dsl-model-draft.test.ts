@@ -169,6 +169,54 @@ describe('用模型生成指标定义草稿', () => {
     expect(JSON.stringify(audit!.detail)).not.toContain('金额取中位数');
   });
 
+  it('模型判断整条做不到（spec 为空对象、unsupported 有原因）时 422 显示它给的原因、不带 Schema 报错；审计阶段 unsupported 只记条数', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    const reason = '预测下个月会流失的消费者';
+    const { received } = fakeLlm(setLlmFetch, () => json({ spec: {}, items: [], unknowns: [], unsupported: [reason] }, USAGE));
+
+    const e = await failure(modelDraftForDefinition(analyst, 'metric', '预测下个月哪些消费者会流失'));
+    expect(e).toBeInstanceOf(DslError);
+    expect(e.status).toBe(422);
+    expect(e.message).toBe(`模型判断做不到：${reason}`);
+    expect(e.message).not.toContain('Schema');
+    expect(e.issues).toEqual([]);
+    // 提示词写出整条做不到时怎么办（#1323）：spec 给空对象、原因进 unsupported
+    expect(received[0]!.body.messages[0]!.content).toContain('整条需求都做不到时 spec 给空对象 {}，原因写进 unsupported');
+    // 宽松 Schema 的「整体做不到」支放行（#1323），schema_valid 仍是宽松校验的结果
+    expect((await calls(acme))[0]).toMatchObject({ purpose: 'metric_draft', schemaValid: true });
+    const [audit] = await failures(acme);
+    expect(audit!.detail).toEqual({ kind: 'metric', stage: 'unsupported', reasons: 1 });
+    expect(JSON.stringify(audit!.detail)).not.toContain('流失');
+  });
+
+  it('模型把「整体做不到」平铺在顶层（没有 spec、顶层没有 base / measure）时同样 422 带原因', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    const reason = '按小时的峰值需要按小时分桶的指标，目录里没有';
+    fakeLlm(setLlmFetch, () => json({ unsupported: [reason] }, USAGE));
+
+    const e = await failure(modelDraftForDefinition(analyst, 'metric', '按小时的订单峰值'));
+    expect(e.status).toBe(422);
+    expect(e.message).toBe(`模型判断做不到：${reason}`);
+    expect((await calls(acme))[0]).toMatchObject({ schemaValid: true });
+    expect((await failures(acme)).map(f => f.detail)).toEqual([expect.objectContaining({ kind: 'metric', stage: 'unsupported', reasons: 1 })]);
+  });
+
+  it('spec 有内容时 unsupported 只作说明：照常生成、逐项说明带回，不进「做不到」出口', async () => {
+    const acme = await newTenant('acme');
+    const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');
+    platformDefault();
+    fakeLlm(setLlmFetch, () => json({ ...MODEL_REVENUE, unsupported: ['还想要按小时的峰值，做不到'] }, USAGE));
+
+    const { yaml, explanation } = await modelDraftForDefinition(analyst, 'metric', REQUEST);
+    expect(parse(yaml)).toEqual(MODEL_REVENUE.spec);
+    expect(explanation).toMatchObject({ unsupported: ['还想要按小时的峰值，做不到'] });
+    expect(await failures(acme)).toHaveLength(0);
+  });
+
   it('转出的 YAML 不过指标校验时拒绝：带问题列表，审计只记问题数与位置，不含取值', async () => {
     const acme = await newTenant('acme');
     const analyst = await memberOf(acme, 'analyst@acme.com', 'analyst');

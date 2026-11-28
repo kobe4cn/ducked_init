@@ -13,7 +13,7 @@ import { MAX_FIXES } from '../../app/.server/assistant/loop';
 import { planCheckText, VALIDATE_PLAN_DESCRIPTION } from '../../app/.server/assistant/tools';
 import { DSL_KINDS, type DslKind } from '../../app/.server/pipeline/dsl';
 import type { MetricSpec, RatioPart } from '../../app/.server/pipeline/dsl/metric-spec';
-import { completeDraftPaths, definitionDraftMessages, definitionDraftSchema, definitionOutputToYaml, METRIC_PARSE_SCHEMA, normalizeParseOutput, SEARCH_LIMIT } from '../../app/.server/pipeline/dsl/model-draft';
+import { completeDraftPaths, definitionDraftMessages, definitionDraftSchema, definitionOutputToYaml, METRIC_PARSE_SCHEMA, normalizeParseOutput, SEARCH_LIMIT, wholeUnsupported } from '../../app/.server/pipeline/dsl/model-draft';
 import { tagMetrics, type TagSpec } from '../../app/.server/pipeline/dsl/tag-spec';
 import { CATALOG, CONTEXT, type GoldenCase, type GoldenEntry } from './golden';
 import { expectedMode } from './plan-modes';
@@ -160,19 +160,26 @@ export async function runCase(provider: LlmProvider, c: GoldenCase): Promise<Cas
   }
   // 指标起草沿用一句话解析的输出形状（#1162）：模型答复是 spec 加三键（宽松 Schema 也放行平铺输出），照产品侧收拢进 spec
   // 再按严格 Schema 校验——不合形状算模型阶段失败（产品的 422 同归因），过了才转 YAML 打分。
-  // 做不到：标签是顶层的 { unsupported }（同产品侧 dsl-definitions 的判法），指标是收拢后非空的 unsupported（Schema 要求 spec 必有，见 #1210 决定）
+  // 做不到：标签是顶层的 { unsupported }（同产品侧 dsl-definitions 的判法），指标是收拢后非空的 unsupported（spec 为空对象时是
+  // 整条做不到，#1323；spec 非空时 Schema 要求它必有，见 #1210 决定，unsupported 只作说明）
   let spec: object | null = out;
   let unsupported: string[] | null = null;
   if (c.kind === 'metric') {
     const parsed = normalizeParseOutput(out as Record<string, unknown>);
-    const validate = validatorFor(METRIC_PARSE_SCHEMA);
-    if (!validate(parsed.output)) {
-      const message = `模型返回的 JSON 不符合 Schema：${schemaErrors(validate)}`;
-      return { ...base, valid: false, ...score(null), failed: { stage: 'model', message } };
+    const whole = wholeUnsupported(parsed.output);
+    if (whole) {
+      unsupported = whole;
+      spec = null;
+    } else {
+      const validate = validatorFor(METRIC_PARSE_SCHEMA);
+      if (!validate(parsed.output)) {
+        const message = `模型返回的 JSON 不符合 Schema：${schemaErrors(validate)}`;
+        return { ...base, valid: false, ...score(null), failed: { stage: 'model', message } };
+      }
+      const output = parsed.output as { spec: object; unsupported?: string[] };
+      spec = output.spec;
+      if (output.unsupported?.length) unsupported = output.unsupported;
     }
-    const output = parsed.output as { spec: object; unsupported?: string[] };
-    spec = output.spec;
-    if (output.unsupported?.length) unsupported = output.unsupported;
   } else if ('unsupported' in out) {
     unsupported = (out as { unsupported: string[] }).unsupported;
     spec = null;
