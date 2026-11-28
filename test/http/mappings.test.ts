@@ -968,12 +968,13 @@ describe('按规则生成映射草稿', () => {
 
   it('模型草稿个别项不过校验时去掉该项、采用其余内容：「生成依据」先单独列出「已去掉」的项（位置加原因），其余项照常按置信度显示', async () => {
     const { sourceId } = await tenantWithSource('acme');
-    // order 映射不给 identity：去掉（规则草稿里也没有）后其余内容过校验
+    // dedupe 的去重键不是映射出来的字段：去掉（规则草稿里也没有）后其余内容过校验；order 多写的 identity 直接忽略（#1321），不算去掉
     modelReplies({
       fields: [
         { field: 'order_id', expr: 'string(order_id)', confidence: 0.95, reason: '源表主键' },
         { field: 'amount', expr: 'amount', confidence: 0.7, reason: '金额列' },
       ],
+      dedupe: { key: ['order_no'], confidence: 0.3, reason: '试试订单号' },
       identity: { match: ['order_id'], confidence: 0.3, reason: '试试主键' },
     });
     const engineer = await loginAs(app, 'de@acme.com');
@@ -984,10 +985,13 @@ describe('按规则生成映射草稿', () => {
     const yaml = editorYaml(html);
     expect(yaml).toMatch(/^# 模型生成的草稿/);
     expect(parseDocument(yaml).toJS()).not.toHaveProperty('identity');
+    expect(parseDocument(yaml).toJS()).not.toHaveProperty('dedupe');
     expect(yaml).toContain('amount: amount # 金额列');
     // 「已去掉」块：位置加原因，不进置信度表
-    expect(html).toContain('data-dropped="identity"');
-    expect(html).toContain('只有消费者（customer）映射能配置身份打通的匹配规则');
+    expect(html).toContain('data-dropped="dedupe"');
+    expect(html).toContain('去重键 order_no 不是本映射映射出来的字段');
+    expect(html).not.toContain('data-confidence-path="dedupe"');
+    expect(html).not.toContain('data-dropped="identity"');
     expect(html).not.toContain('data-confidence-path="identity"');
     // 其余项照常显示置信度（按置信度升序：amount 0.7 在前）
     expect(html).toMatch(/data-confidence-path="fields\.amount"[\s\S]*?data-confidence-path="fields\.order_id"/);
