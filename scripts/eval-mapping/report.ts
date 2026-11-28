@@ -27,12 +27,15 @@ export interface EvalReport {
 const EMPTY_CONTEXT: TableContext = { table: '', rows: 0, primaryKey: [], keyCandidates: [], columns: [] };
 
 /**
- * 提示词哈希：映射草稿的 system 消息加输出 Schema 的 sha256 前 12 位；改了提示词或 Schema 就变。
+ * 提示词哈希：映射草稿两个版本的 system 消息（先非 customer 后 customer，#1321）加输出 Schema 的 sha256 前 12 位；任一版提示词或 Schema 改了就变。
  * 默认按带固定目录（与评测发给模型的相同）算；带目录的 system 消息与目录内容无关，所以哈希只区分带不带目录。catalog 传 null 算不带目录的
  */
 export function promptHash(schema: object = MODEL_DRAFT_SCHEMA, catalog: Catalog | null = CATALOG): string {
-  const system = modelDraftMessages(EMPTY_CONTEXT, '', '', catalog ?? undefined).find(m => m.role === 'system')?.content ?? '';
-  return createHash('sha256').update(system).update(JSON.stringify(schema)).digest('hex').slice(0, 12);
+  const hash = createHash('sha256');
+  for (const entity of ['', 'customer']) {
+    hash.update(modelDraftMessages(EMPTY_CONTEXT, entity, '', catalog ?? undefined).find(m => m.role === 'system')?.content ?? '');
+  }
+  return hash.update(JSON.stringify(schema)).digest('hex').slice(0, 12);
 }
 
 export function toReport(results: CaseResult[], total: Score & CaseCounts, meta: { model: string; baseUrl: string; startedAt: Date }): EvalReport {
