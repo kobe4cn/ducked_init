@@ -2,8 +2,8 @@
 // 查看者看不到 source: / table: 条目，数据源相关原因（含源视图发布与删除数据源）的版本只显示「数据源结构变化」、不列明细（ADR-0005）；还没有版本时显示空状态
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { catalogVersions } from '../../app/.server/db/schema';
-import { memberOf, newTenant } from '../pipeline/fixtures';
+import { catalogVersions, sources, sourceTables, tasks } from '../../app/.server/db/schema';
+import { defaultSpaceOf, memberOf, newTenant } from '../pipeline/fixtures';
 import { publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { loginAs, resetDb, startApp, type TestApp } from './harness';
 
@@ -149,6 +149,43 @@ describe('目录变更记录', () => {
     expect(viewer).toContain('数据源结构变化');
     expect(viewer).not.toContain('data-diff-id=');
     expect(viewer).not.toContain('新增列');
+  });
+
+  it('规则不再列出的列显示「不再列出」，源端真删了的列仍显示「删除列」；查看者整条打码看不到列名（#1334）', async () => {
+    const delta = await newTenant('delta');
+    // 不走真实登记与采集：loadCatalogInput 读的就是这三张表，直接写数据源、同步范围内的表与最近一次成功采集（列未经敏感列过滤）
+    const [src] = await getDb().insert(sources).values({
+      tenantId: delta, spaceId: await defaultSpaceOf(delta), name: 'SCANS', kind: 'postgres' as const, config: {}, credentials: '',
+    }).returning({ id: sources.id });
+    await getDb().insert(sourceTables).values({ sourceId: src!.id, tableName: 'scan_users', inScope: true });
+    await getDb().insert(tasks).values({
+      tenantId: delta, kind: 'source.profile', status: 'succeeded', finishedAt: new Date(), params: { sourceId: src!.id },
+      result: { tables: [{ name: 'scan_users', columns: [{ name: 'openid', type: 'text' }, { name: 'nickname', type: 'text' }] }] },
+    });
+    // #1212 上线后第一次同步记的版本：openid 改按敏感列处理、从目录条目里消失，记在了 removed 名下；legacy_id 是源端真删了的列
+    await getDb().insert(catalogVersions).values({
+      tenantId: delta, version: 1, snapshot: [], reason: 'source.synced',
+      diff: {
+        added: [], removed: [],
+        changed: [{ id: 'table:SCANS/scan_users', kind: 'table' as const, name: 'SCANS/scan_users', keys: ['columns'], columns: { added: [], removed: ['legacy_id', 'openid'] } }],
+      },
+    });
+
+    const admin = await (await (await loginAs(app, 'admin@delta.com')).get('/catalog/changes')).text();
+    const row = admin.slice(admin.indexOf('data-diff-id="table:SCANS/scan_users"'));
+    // 采集里还在的 openid 是规则不再列出，不在「删除列」里；采集里没有的 legacy_id 照旧是「删除列」
+    expect(row).toContain('data-diff-columns-unlisted="openid"');
+    expect(row).toContain('不再列出（源端仍在，按平台规则不展示）：openid');
+    expect(row).toContain('data-diff-columns-removed="legacy_id"');
+    expect(row).toContain('删除列：legacy_id');
+    expect(row).not.toContain('data-diff-columns-removed="legacy_id,openid"');
+    expect(row).not.toContain('删除列：openid');
+
+    await memberOf(delta, 'viewer@delta.com', 'viewer');
+    const viewer = await (await (await loginAs(app, 'viewer@delta.com')).get('/catalog/changes')).text();
+    expect(viewer).toContain('数据源结构变化');
+    expect(viewer).not.toContain('openid');
+    expect(viewer).not.toContain('不再列出');
   });
 
   it('还没有任何版本时显示空状态', async () => {

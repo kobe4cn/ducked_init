@@ -257,6 +257,7 @@
   "不使用": "Do not use",
   "不允许": "Not allowed",
   "不兼容": "incompatible",
+  "不再列出（源端仍在，按平台规则不展示）：{columns}": "No longer listed (still present at the source, hidden by platform rules): {columns}",
   "不写": "Leave blank",
   "不写兜底（合并失败并列出这些取值）": "No fallback (the merge fails and these values are listed)",
   "不勾的那类接口，这把 Key 调用时返回 403。": "Calls to unchecked API types with this key return 403.",
