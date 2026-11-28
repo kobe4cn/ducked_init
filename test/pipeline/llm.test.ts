@@ -336,7 +336,7 @@ describe('模型服务客户端', () => {
     platformDefault(BASE_WITH_SLASH);
     const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
 
-    await chatJson(acme, 'metric_parse', MESSAGES, { anyOf: [SCHEMA, { type: 'object', required: ['error'] }] });
+    await chatJson(acme, 'assertion_draft', MESSAGES, { anyOf: [SCHEMA, { type: 'object', required: ['error'] }] });
     expect(received).toHaveLength(1);
     expect(received[0].body.response_format).toEqual({ type: 'json_object' });
   });
@@ -423,10 +423,10 @@ describe('模型服务客户端', () => {
     // fast 档绑了模型后 LLM_FAST_CHAT_EXTRA 覆盖默认 extra：默认的 top_p 不再出现
     platformTier('fast', 'qwen3.8-flash');
     vi.stubEnv('LLM_FAST_CHAT_EXTRA', JSON.stringify({ enable_thinking: false, top_k: 5 }));
-    await chatJson(acme, 'metric_parse', MESSAGES, SCHEMA);
+    await chatJson(acme, 'assertion_draft', MESSAGES, SCHEMA);
     expect(received[2].body).toEqual({
       enable_thinking: false, top_k: 5,
-      model: 'qwen3.8-flash', messages: MESSAGES, response_format: asSchema('metric_parse'), temperature: 0,
+      model: 'qwen3.8-flash', messages: MESSAGES, response_format: asSchema('assertion_draft'), temperature: 0,
     });
   });
 
@@ -549,7 +549,7 @@ describe('按用途选档位（ADR-0055）', () => {
     const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
 
     await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
-    await chatJson(acme, 'metric_parse', MESSAGES, SCHEMA);
+    await chatJson(acme, 'assertion_draft', MESSAGES, SCHEMA);
 
     expect(received[0].url).toBe('https://platform.example.com/v1/chat/completions');
     expect(received[0].headers.get('authorization')).toBe('Bearer sk-platform-secret');
@@ -557,7 +557,7 @@ describe('按用途选档位（ADR-0055）', () => {
     expect(received[1].body.model).toBe('qwen-plus');
     const rows = await calls(acme);
     expect(rows[0]).toMatchObject({ purpose: 'mapping_draft', model: 'qwen-max', route: 'reasoning', fallbackReason: null });
-    expect(rows[1]).toMatchObject({ purpose: 'metric_parse', model: 'qwen-plus', route: 'fast', fallbackReason: 'unbound' });
+    expect(rows[1]).toMatchObject({ purpose: 'assertion_draft', model: 'qwen-plus', route: 'fast', fallbackReason: 'unbound' });
   });
 
   it('档位的 BASE_URL 与 API_KEY 一起填时整套用档位自己的端点与 Key', async () => {
@@ -648,7 +648,7 @@ describe('按用途选档位（ADR-0055）', () => {
     const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
 
     await chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA);
-    await chatJson(acme, 'metric_parse', MESSAGES, SCHEMA);
+    await chatJson(acme, 'assertion_draft', MESSAGES, SCHEMA);
 
     expect(received[0].url).toBe('https://tenant.example.com/v1/chat/completions');
     expect(received[0].headers.get('authorization')).toBe('Bearer sk-tenant-secret');
@@ -739,18 +739,18 @@ describe('按用途选档位（ADR-0055）', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const env = (raw: string): Record<string, string | undefined> => ({ LLM_PURPOSE_TIER_OVERRIDES: raw });
 
-    expect(purposeTier('metric_parse', env('{"metric_parse":"reasoning"}'))).toBe('reasoning');
+    expect(purposeTier('knowledge_import', env('{"knowledge_import":"reasoning"}'))).toBe('reasoning');
     expect(purposeTier('assistant', env('{"assistant":"fast"}'))).toBe('fast');
     // 没填或空串：默认表，不告警
-    expect(purposeTier('metric_parse', {})).toBe('fast');
-    expect(purposeTier('metric_parse', env(''))).toBe('fast');
+    expect(purposeTier('knowledge_import', {})).toBe('fast');
+    expect(purposeTier('knowledge_import', env(''))).toBe('fast');
     expect(tiersByPurpose({})).toEqual(tiersByPurpose(env('')));
     expect(warn).not.toHaveBeenCalled();
 
     // 非法 JSON、数组、标量：整体忽略并告警一次，告警带原文
-    for (const raw of ['{bad', '[{"metric_parse":"reasoning"}]', '"fast"', 'null', '3']) {
+    for (const raw of ['{bad', '[{"knowledge_import":"reasoning"}]', '"fast"', 'null', '3']) {
       warn.mockClear();
-      expect(purposeTier('metric_parse', env(raw)), raw).toBe('fast');
+      expect(purposeTier('knowledge_import', env(raw)), raw).toBe('fast');
       expect(warn, raw).toHaveBeenCalledTimes(1);
       expect(warn).toHaveBeenCalledWith(expect.stringContaining(`LLM_PURPOSE_TIER_OVERRIDES=${JSON.stringify(raw)}`));
     }
@@ -758,12 +758,12 @@ describe('按用途选档位（ADR-0055）', () => {
     // 逐项非法（未知用途、connectivity / tool_probe / embedding 不分档、档位不是 fast / reasoning、值为 null）：各告警一次后跳过，其余合法项照常生效
     warn.mockClear();
     const mixed = env(JSON.stringify({
-      metric_parse: 'reasoning', assistant: 'fast', nope: 'fast', connectivity: 'fast', tool_probe: 'reasoning', embedding: 'fast',
+      knowledge_import: 'reasoning', assistant: 'fast', nope: 'fast', connectivity: 'fast', tool_probe: 'reasoning', embedding: 'fast',
       metric_draft: 'ultra', tag_draft: null,
     }));
     expect(tiersByPurpose(mixed)).toEqual({
-      fast: ['assistant', 'assertion_draft', 'workbench_interpret', 'knowledge_proposal', 'knowledge_import'],
-      reasoning: ['mapping_draft', 'metric_draft', 'tag_draft', 'workbench_draft', 'metric_parse'],
+      fast: ['assistant', 'assertion_draft', 'workbench_interpret', 'knowledge_proposal'],
+      reasoning: ['mapping_draft', 'metric_draft', 'tag_draft', 'workbench_draft', 'knowledge_import'],
     });
     expect(warn).toHaveBeenCalledTimes(6);
     expect(warn.mock.calls.map(c => String(c[0]))).toEqual([
@@ -775,36 +775,42 @@ describe('按用途选档位（ADR-0055）', () => {
       expect.stringContaining('tag_draft'),
     ]);
     for (const call of warn.mock.calls) expect(String(call[0])).toContain(`LLM_PURPOSE_TIER_OVERRIDES=${JSON.stringify(mixed.LLM_PURPOSE_TIER_OVERRIDES)}`);
-    expect(tiersByPurpose(env('{"metric_parse":"reasoning"}')).fast).not.toContain('metric_parse');
+    expect(tiersByPurpose(env('{"knowledge_import":"reasoning"}')).fast).not.toContain('knowledge_import');
+
+    // #1316：metric_parse 已从用途表删掉，覆盖里再写它按未知键忽略，对照与默认一致并告警一次
+    warn.mockClear();
+    expect(tiersByPurpose(env('{"metric_parse":"reasoning"}'))).toEqual(tiersByPurpose({}));
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]![0])).toContain('metric_parse');
   });
 
-  it('LLM_PURPOSE_TIER_OVERRIDES 把 metric_parse 挪到 reasoning：平台档位变量对覆盖后的档位生效，llm_calls.route 记 reasoning（#1277）', async () => {
+  it('LLM_PURPOSE_TIER_OVERRIDES 把 knowledge_import 挪到 reasoning：平台档位变量对覆盖后的档位生效，llm_calls.route 记 reasoning（#1277）', async () => {
     const acme = await newTenant('acme');
     platformDefault(BASE_WITH_SLASH);
     platformTier('reasoning', 'qwen-max');
-    vi.stubEnv('LLM_PURPOSE_TIER_OVERRIDES', '{"metric_parse":"reasoning"}');
+    vi.stubEnv('LLM_PURPOSE_TIER_OVERRIDES', '{"knowledge_import":"reasoning"}');
     const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
 
-    await chatJson(acme, 'metric_parse', MESSAGES, SCHEMA);
+    await chatJson(acme, 'knowledge_import', MESSAGES, SCHEMA);
     await chatJson(acme, 'assertion_draft', MESSAGES, SCHEMA);
 
     expect(received[0].body.model).toBe('qwen-max');
-    expect((await calls(acme))[0]).toMatchObject({ purpose: 'metric_parse', model: 'qwen-max', route: 'reasoning', fallbackReason: null });
+    expect((await calls(acme))[0]).toMatchObject({ purpose: 'knowledge_import', model: 'qwen-max', route: 'reasoning', fallbackReason: null });
     expect(received[1].body.model).toBe('qwen-plus');
     expect((await calls(acme))[1]).toMatchObject({ purpose: 'assertion_draft', route: 'fast', fallbackReason: 'unbound' });
   });
 
-  it('租户自配档位时覆盖同样生效：metric_parse 挪到 reasoning 后用租户 reasoning 档的模型（#1277）', async () => {
+  it('租户自配档位时覆盖同样生效：knowledge_import 挪到 reasoning 后用租户 reasoning 档的模型（#1277）', async () => {
     const acme = await newTenant('acme');
     platformDefault(BASE_WITH_SLASH);
     await tenantProvider(acme, { fast: { model: 'deepseek-chat-fast' }, reasoning: { model: 'deepseek-reasoner' } });
-    vi.stubEnv('LLM_PURPOSE_TIER_OVERRIDES', '{"metric_parse":"reasoning"}');
+    vi.stubEnv('LLM_PURPOSE_TIER_OVERRIDES', '{"knowledge_import":"reasoning"}');
     const { received } = fakeLlm(setLlmFetch, () => json({ table: 'orders' }, USAGE));
 
-    await chatJson(acme, 'metric_parse', MESSAGES, SCHEMA);
+    await chatJson(acme, 'knowledge_import', MESSAGES, SCHEMA);
 
     expect(received[0].body.model).toBe('deepseek-reasoner');
-    expect((await calls(acme))[0]).toMatchObject({ purpose: 'metric_parse', route: 'reasoning', fallbackReason: null });
+    expect((await calls(acme))[0]).toMatchObject({ purpose: 'knowledge_import', route: 'reasoning', fallbackReason: null });
   });
 });
 

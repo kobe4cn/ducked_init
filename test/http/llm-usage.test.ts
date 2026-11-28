@@ -110,6 +110,17 @@ describe('模型调用统计', () => {
     expect(list).not.toContain('99999');
   });
 
+  it('已删除用途 metric_parse 的历史调用照常按用途显示（#1316）：页面按原字符串渲染，不因用途表删掉而消失', async () => {
+    const acme = await newTenant('acme');
+    await call(acme, { purpose: 'metric_parse', model: 'qwen-plus', promptTokens: 10, completionTokens: 5, schemaValid: true });
+
+    const admin = await loginAs(app, 'admin@acme.com');
+    const html = await (await admin.get('/llm-usage?days=7')).text();
+    const row = usageRow(html, 'metric_parse');
+    expect(row).not.toBe('');
+    expect(usageCell(row, 'calls')).toBe('1');
+  });
+
   it('映射草稿一行有「校验通过率」（部分采用单独计数），其他用途与总计是「—」，别的租户与窗口外不计入', async () => {
     const acme = await newTenant('acme');
     const globex = await newTenant('globex');

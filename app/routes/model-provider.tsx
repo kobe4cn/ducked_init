@@ -173,7 +173,7 @@ function EmbeddingFillStatus({ fill }: { fill: { at: string | null; error: strin
 const purposeLabel = (t: T, purpose: TieredPurpose) => {
   const labels: Record<TieredPurpose, string> = {
     assistant: t('AI 助手'), mapping_draft: t('起草映射'), metric_draft: t('起草指标'), tag_draft: t('起草标签'), workbench_draft: t('工作台起草'),
-    assertion_draft: t('断言草稿'), workbench_interpret: t('工作台结果解读'), knowledge_proposal: t('知识提案'), knowledge_import: t('知识导入'), metric_parse: t('一句话解析'),
+    assertion_draft: t('断言草稿'), workbench_interpret: t('工作台结果解读'), knowledge_proposal: t('知识提案'), knowledge_import: t('知识导入'),
   };
   return labels[purpose];
 };
