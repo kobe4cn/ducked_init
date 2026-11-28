@@ -1,6 +1,7 @@
 // test/pipeline/draft-search.test.ts —— 起草检索（#827 之一）的接缝：modelDraftForDefinition / draftSearch → rankedSearch（租户 hybrid_search
 // 开关带向量一路，ADR-0049）+ judgeAmbiguity（歧义与词的默认指向，ADR-0056）。开混合时只靠向量命中的指标进起草上下文、关着时不进且照常起草；
-// 两个指标挂同一个别名时结果带歧义提示；设默认指向后不再提示、默认条目排第一
+// 两个指标挂同一个别名时结果带歧义提示；设默认指向后不再提示、默认条目排第一；
+// 不同实体的同名字段判成歧义时，候选名称带所属实体区分（#1319）
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { draftSearch } from '../../app/.server/catalog/draft-search';
@@ -141,5 +142,16 @@ describe('起草检索', () => {
     expect(settled.ambiguity).toBe(null);
     expect(settled.entries[0]!.id).toBe('metric:revenue_365d');
     expect(settled.entries.slice(0, 2).map(e => e.id).sort()).toEqual(['metric:gmv_365d', 'metric:revenue_365d']);
+  });
+
+  it('不同实体的同名字段判成歧义：候选名称带所属实体区分，不再只显示分不清的重名（订单与同意记录的 channel 都叫「渠道」）', async () => {
+    const { analyst } = await setup();
+
+    // 「渠道」同时命中 order.channel 与 consent.channel（标准模型里两个字段都叫「渠道」，实体分别是「订单」「营销同意」）：
+    // 判成歧义时两个候选的名称互不相同——各带所属实体的名称
+    const ambiguous = await draftSearch(analyst, '渠道', SEARCH_LIMIT);
+    const group = ambiguous.ambiguity?.groups.find(g => g.term === '渠道');
+    expect(group?.candidates.map(c => c.id).sort()).toEqual(['field:consent.channel', 'field:order.channel']);
+    expect(group?.candidates.map(c => c.name).sort()).toEqual(['营销同意 · 渠道', '订单 · 渠道']);
   });
 });
