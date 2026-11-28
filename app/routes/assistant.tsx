@@ -6,6 +6,7 @@
 // 同一成员同时只能有一轮（#1249）：跑问答前先占位（进程内，多实例部署时只限本进程），已有一轮进行中时 429 且不发模型请求；前置校验（问题为空、对话不存在、分享来的对话 403 等）在占位之前，share / unshare 与 knowledge.propose 不占；
 // 计划随对话保存（ADR-0050）：本轮校验过的计划存进 assistant 消息，续写时把对话里最近一份带给 assistantTurn 作 priorPlan（存草稿前重新校验用），发给模型的只有文字；
 // 计划卡（#452，P4⑯a）：带 plan 的消息在读时按读者自己的目录组装 planCard（读时再校验、不存状态），POST 返回与 ?id= 读回都带；
+// 读者没有 definitions:draft 权限时卡片再补 canDraft: false，前端不给「存草稿」、改提示转给能起草的角色（#1327），权限只在显示层拦；
 // 读回响应只给 planCard、不给原始 plan（#539：被分享人看不到的 excluded 条目 id 不能出现在 HTML / JSON 里），
 // 被分享人看到的卡片按他自己的目录组装（ADR-0005），卡片只进响应、不写库、不进发给模型的 content；
 // 歧义追问的结构化候选（⑥-3，ADR-0047 / 0046）：判为歧义的那轮 assistant 消息带 choices（词与候选条目 id，加密保存），
@@ -92,7 +93,7 @@ export async function loader({ request }: Route.LoaderArgs) {
           const askCard = chosen ? await askCardFor(member, chosen, i - 1) : null;
           return {
             ...m,
-            ...(plan && catalog ? { planCard: planCardView(catalog, plan, pair?.other) } : {}),
+            ...(plan && catalog ? { planCard: { ...planCardView(catalog, plan, pair?.other), ...(can(member.role, 'definitions:draft') ? {} : { canDraft: false as const }) } } : {}),
             ...(choices && catalog ? { choices: choicesView(catalog, choices) } : {}),
             ...(askCard ? { askCard } : {}),
           };
@@ -198,7 +199,7 @@ export async function action({ request }: Route.ActionArgs) {
       return Response.json({
         conversationId, reply, toolsUsed,
         ...(workbenchSql ? { workbenchSql } : {}),
-        ...(plan && catalog ? { planCard: planCardView(catalog, plan, pair?.other) } : {}),
+        ...(plan && catalog ? { planCard: { ...planCardView(catalog, plan, pair?.other), ...(can(member.role, 'definitions:draft') ? {} : { canDraft: false as const }) } } : {}),
         ...(choices && catalog ? { choices: choicesView(catalog, choices) } : {}),
         ...(askCard ? { askCard } : {}),
       });

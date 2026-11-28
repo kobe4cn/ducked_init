@@ -352,6 +352,7 @@
   "作者": "Authors",
   "你": "You",
   "你当前的角色不能执行查询，令牌拿不到 run_query": "Your current role cannot run queries, so tokens won't get run_query",
+  "你的角色不能起草定义，可把这份计划转给分析师、数据工程师或管理员": "Your role can't draft definitions. Pass this plan to an Analyst, Data engineer or Admin.",
   "你看不到的条目": "An entry you cannot see",
   "你能看到的目录已变化（例如角色调整），请重新提问": "The catalog you can see has changed (for example, your role changed). Please ask again",
   "使用": "Use",

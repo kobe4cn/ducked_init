@@ -8,7 +8,7 @@
 // 有结果页的条目（模板 / 指标 / 标签，实体与源表没有结果页，路由见 app/routes.ts），找不到就不给（#453）。纯函数：
 // 同一份目录与计划每次相同。传入另一类可见性的目录（other，ADR-0047）时，区分「读者看到的目录变了」（#1190）：哈希不一致但
 // 等于另一类目录里同 id 条目的哈希、或读者目录里没有而另一类目录里有的条目，不算条目问题，只给 catalogChanged——
-// 另一类目录里的任何内容都不进卡片（读者看不到的东西不能泄露）
+// 另一类目录里的任何内容都不进卡片（读者看不到的东西不能泄露）。读者能不能起草由路由按角色补 canDraft（#1327），这里不查权限
 import { expand, type Catalog, type CatalogEntry, type MetricEntry } from '../catalog';
 import { planRetrievedIds, semanticHash, validatePlan, type AnalysisPlan, type PlanIssue, type PlanMode, type PlanStatus } from '../catalog/plan';
 
@@ -30,6 +30,8 @@ export interface PlanCardView {
   excluded?: { id?: string; name?: string; reason: string }[];
   /** 重新校验通过且 reuse_result 时链到现有结果页；所选条目都没有结果页或没通过时不带 */
   resultHref?: string;
+  /** 读者没有起草权限（definitions:draft）时为 false，不带表示可以起草；由路由按读者角色补上（#1327），planCardView 不写这个键 */
+  canDraft?: false;
 }
 
 /** 条目的数据截至：模板、指标与标签取最新快照时间，实体取最近一次合并时间，源表取采样时间，其他条目或没有快照时写「暂无快照」 */

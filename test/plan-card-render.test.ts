@@ -1,7 +1,8 @@
 // test/plan-card-render.test.ts —— 计划卡组件的服务端渲染（#453，P4⑯b，纯函数，不连库；仓库没有 jsdom，用
 // renderToStaticMarkup，Link 要包在 MemoryRouter 里，onClick 不会被渲染，按钮按 data-next 断言）：valid 时按 mode
 // 给下一步入口——reuse_result 链到所选条目的结果页、draft_definition 给「存草稿」按钮、draft_query 有 workbenchSql
-// 给「填入工作台」链接、没有给按钮；不传 onFollowUp（被分享人只读）时没有按钮、链接照样渲染；invalid 只提示重新提问，catalogChanged（#1190）时提示「你能看到的目录已变化」；
+// 给「填入工作台」链接、没有给按钮；不传 onFollowUp（被分享人只读）时没有按钮、链接照样渲染；canDraft: false（读者没有起草权限，
+// #1327）时 draft_definition 不给「存草稿」、改一行灰字提示；invalid 只提示重新提问，catalogChanged（#1190）时提示「你能看到的目录已变化」；
 // clarify / needs_clarification 用 amber 列出问题与建议；unsupported 用 red 给出原因与「新建定义」；「排除了哪些口径」
 // （#539）有名称的项显示名称与原因、没名称的显示「你看不到的条目」，没有 excluded 时没有这个标题
 import { createElement } from 'react';
@@ -34,6 +35,14 @@ describe('计划卡的下一步入口', () => {
     noEntry(render(card({ mode: 'draft_definition' })));
     expect(render(card({ mode: 'reuse_result', resultHref: '/analytics/definitions/metric/revenue_30d' })))
       .toContain('data-next="result"');
+  });
+
+  it('canDraft: false 的 draft_definition 卡不给「存草稿」按钮，改为一行灰字提示；不带 canDraft 时照旧给按钮（#1327）', () => {
+    const html = render(card({ mode: 'draft_definition', canDraft: false }), { onFollowUp: () => {} });
+    expect(html).not.toContain('data-next="draft"');
+    expect(html).toContain('你的角色不能起草定义，可把这份计划转给分析师、数据工程师或管理员');
+    // 不带 canDraft（读者有起草权限）时照旧给按钮
+    expect(render(card({ mode: 'draft_definition' }), { onFollowUp: () => {} })).toContain('<button type="button" data-next="draft"');
   });
 
   it('valid 的 draft_query 有 workbenchSql 时是带 data-prefill 的「填入工作台」链接，没有时是按钮（只读时都没有）', () => {
