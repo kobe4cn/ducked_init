@@ -498,17 +498,24 @@ function present(r: AuditRow) {
   };
 }
 
-/** 筛选下拉的选项：登记过的动作，中文 label 按拼音排序；「全部」由页面自己加 */
+/** 平台级事件的动作前缀（租户为空，只在运营后台可见），租户审计页的筛选不列也不认 */
+const PLATFORM_ACTION_PREFIXES = ['operator.', 'model_price.'];
+
+/** 租户审计页可筛选的动作键：登记过的动作去掉平台级事件 */
+const TENANT_ACTION_KEYS = Object.keys(ACTIONS).filter(k => !PLATFORM_ACTION_PREFIXES.some(p => k.startsWith(p)));
+
+/** 筛选下拉的选项：登记过的租户动作（不含平台级事件），中文 label 按拼音排序；「全部」由页面自己加 */
 export function auditActionOptions() {
   return Object.entries(ACTIONS)
+    .filter(([value]) => TENANT_ACTION_KEYS.includes(value))
     .map(([value, a]) => ({ value, label: a.label }))
     .sort((x, y) => cmpName(x.label, y.label));
 }
 
-/** 把 ?action= 规范化：是登记过的动作键、或以 . 结尾且确实是某些键的前缀时原样返回，其余（含空）返回 null（＝全部） */
+/** 把 ?action= 规范化：是登记过的租户动作键（不含平台级事件）、或以 . 结尾且确实是某些键的前缀时原样返回，其余（含空）返回 null（＝全部） */
 export function normalizeAuditAction(value: string | null | undefined): string | null {
   if (!value) return null;
-  const keys = Object.keys(ACTIONS);
+  const keys = TENANT_ACTION_KEYS;
   return keys.includes(value) || (value.endsWith('.') && keys.some(k => k.startsWith(value))) ? value : null;
 }
 
