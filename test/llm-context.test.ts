@@ -39,4 +39,19 @@ describe('buildTableContext', () => {
     expect(buildTableContext(PROFILE, samples).samples).toEqual(samples);
     expect(buildTableContext(PROFILE, []).samples).toEqual([]);
   });
+
+  it('敏感列名的 min / max 剔成 null，兜住旧的采集结果（#1317）：BIGINT 手机号、DATE 生日都不带，普通数值列保持原值', () => {
+    const context = buildTableContext({
+      ...PROFILE,
+      columns: [
+        { name: '买家手机号', type: 'BIGINT', nullRate: 0.5841, distinct: 1990, min: '13000000029', max: '13000000035' },
+        { name: 'birthday', type: 'DATE', nullRate: 0, distinct: 30, min: '1990-01-01', max: '2000-12-31' },
+        { name: '数量', type: 'INTEGER', nullRate: 0, distinct: 5, min: '1', max: '9' },
+      ],
+    });
+    const byName = Object.fromEntries(context.columns.map(c => [c.name, c]));
+    expect(byName['买家手机号']).toMatchObject({ min: null, max: null });
+    expect(byName['birthday']).toMatchObject({ min: null, max: null });
+    expect(byName['数量']).toMatchObject({ min: '1', max: '9' });
+  });
 });

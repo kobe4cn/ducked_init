@@ -156,13 +156,14 @@ describe('采集表清单、列统计与水位线候选', () => {
     const engineer = await memberOf(acme, 'de@acme.com');
     const input = await pgSourceInput(READER);
     await grantOnSource(`
-      CREATE TABLE shop.contacts (channel text, note text, contact_tel text, backup text, extra text);
+      CREATE TABLE shop.contacts (channel text, note text, contact_tel text, backup text, extra text, mobile bigint);
       INSERT INTO shop.contacts SELECT
         CASE WHEN i % 3 = 0 THEN 'web' ELSE 'app' END,
         repeat('长', 200 + i % 2),
         '021-' || (i % 5),
         CASE WHEN i % 4 = 0 THEN '1380000000' || (i % 10) ELSE 'none' END,
-        CASE WHEN i % 10 = 0 THEN 'u' || i || '@acme.com' ELSE 'none' END
+        CASE WHEN i % 10 = 0 THEN 'u' || i || '@acme.com' ELSE 'none' END,
+        13000000000 + i
       FROM generate_series(1, 30) i;
       GRANT SELECT ON shop.contacts TO ${READER.user};`);
     const { id } = await registerSource(engineer, input);
@@ -186,6 +187,9 @@ describe('采集表清单、列统计与水位线候选', () => {
     expect(contacts.contact_tel.top).toBeUndefined();
     expect(contacts.backup.top).toBeUndefined();
     expect(contacts.extra.top).toBeUndefined();
+    // 敏感列名的数值列连 min / max 也不存（#1317）
+    expect(contacts.mobile.min).toBeNull();
+    expect(contacts.mobile.max).toBeNull();
   });
 
   it('openid、unionid、external_userid 等第三方用户 ID 列即使低基数也不保存取值（#1212）', async () => {
