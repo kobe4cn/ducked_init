@@ -6,7 +6,8 @@
 // （golden.ts 的 HOLDOUT，不参与调参）各一张 Markdown 表，可直接贴进 docs/test-plans/requirements-eval-baseline.md。
 // 有 LLM_* 时先用真实模型对全部条目跑计划模式（runPlanCase）再打这两张表，再按期望模式（调参集 + 验收集）打一张计划模式表（#1227）。
 // 再在配了 LLM_EMBEDDING_*（三项都有，与 chat 的 LLM_* 互不影响）时对固定目录真实算一次向量，调参集与验收集各打印「向量关 / 向量开」
-// 两组指标与合计 Recall@20 的差值（#416，ADR-0049）；没配只跳过开关对比。
+// 两组指标与合计 Recall@20 的差值（#416，ADR-0049）；分批条数用 embedBatchSize()（LLM_EMBEDDING_BATCH_SIZE，默认 10，与 embeddings.ts 的补算一致），
+// 没配或 embedding 调用失败时只跳过开关对比，不影响后面的起草段与结果文件。
 // 最后在有 LLM_* 时对有 expected 或标了期望做不到（#1210）的样例用真实模型服务走与产品相同的起草消息（固定目录）、输出 Schema 与转 YAML，打印每例与调参集 / 验收集
 // 的校验通过率与结构命中率；缺密钥跳过计划模式与起草。结果另存到 scripts/eval-requirements/out/<时间戳>-<模型名或 deterministic>.json。
 // 不连平台库，不进 CI；不打印也不保存 Key、完整 URL、请求与模型原文
@@ -14,8 +15,9 @@ import { execSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { cmp } from '../app/lib/compare';
+import { embedBatchSize } from '../app/.server/catalog/embeddings';
 import { PLAN_MODES, type PlanMode } from '../app/.server/catalog/plan';
-import { callEmbeddings, platformEmbeddingProvider, platformProvider } from '../app/.server/llm';
+import { callEmbeddings, LlmError, platformEmbeddingProvider, platformProvider } from '../app/.server/llm';
 import { GOLDEN, GOLDEN_ALL, HOLDOUT } from './eval-requirements/golden';
 import { GROUP_KEYS, groupByMode, groupByType, retrievalRows, VIEWS, type GroupKey, type GroupStats, type RetrievalRow, type RetrievalVectors } from './eval-requirements/retrieval';
 import { runCase, runPlanCase, summarize, type CaseResult, type FailStage, type Summary } from './eval-requirements/score';
@@ -89,11 +91,11 @@ if (EMBED_VARS.some(v => !process.env[v])) {
   console.log('\n开关对比：未配置 embedding，跳过开关对比');
 } else {
   const provider = platformEmbeddingProvider();
-  // 每批 64 条，对齐 embeddings.ts 的 EMBED_BATCH（一次 /embeddings 请求的输入条数）
-  const BATCH = 64;
   const embedBatched = async (texts: string[]): Promise<number[][]> => {
+    // 每批条数用 embedBatchSize()（一次 /embeddings 请求的输入条数，LLM_EMBEDDING_BATCH_SIZE 默认 10）：写死 64 超过 DashScope 每批上限会 400
+    const batch = embedBatchSize();
     const out: number[][] = [];
-    for (let i = 0; i < texts.length; i += BATCH) out.push(...await callEmbeddings(provider, texts.slice(i, i + BATCH)));
+    for (let i = 0; i < texts.length; i += batch) out.push(...await callEmbeddings(provider, texts.slice(i, i + batch)));
     return out;
   };
   // 行向量：两类视图的非能力行按 textHash 去重（两类视图同一条目的文本可能不同、哈希不同，都要），按哈希排序让分批顺序确定
@@ -101,25 +103,31 @@ if (EMBED_VARS.some(v => !process.env[v])) {
     .flatMap(v => v.rows.filter(r => !r.entryId.startsWith('capability:')).map(r => [r.textHash, r.text] as const)))
     .entries()]
     .sort((a, b) => cmp(a[0], b[0]));
-  const rowVectors = await embedBatched(rowTexts.map(([, text]) => text));
-  const queries = GOLDEN_ALL.map(g => [g.id, g.retrieval.query] as const);
-  const queryVectors = await embedBatched(queries.map(([, query]) => query));
-  const vectors: RetrievalVectors = {
-    rows: new Map(rowTexts.map(([hash], i) => [hash, rowVectors[i]!])),
-    queries: new Map(queries.map(([id], i) => [id, queryVectors[i]!])),
-  };
-  const on = split(retrievalRows(GOLDEN_ALL, vectors));
-  console.log(`\n开关对比：embedding 模型 ${provider.model}，向量关 / 向量开`);
-  table('调参集（向量关）', retrieval.tuning);
-  table('调参集（向量开）', on.tuning);
-  table('验收集（向量关）', retrieval.holdout);
-  table('验收集（向量开）', on.holdout);
-  const recallDelta = {
-    tuning: on.tuning.合计.recall === null || retrieval.tuning.合计.recall === null ? null : on.tuning.合计.recall - retrieval.tuning.合计.recall,
-    holdout: on.holdout.合计.recall === null || retrieval.holdout.合计.recall === null ? null : on.holdout.合计.recall - retrieval.holdout.合计.recall,
-  };
-  console.log(`合计 Recall@20 差值（开 − 关）：调参集 ${pp(recallDelta.tuning)}、验收集 ${pp(recallDelta.holdout)}`);
-  retrievalHybrid = { off: retrieval, on, recallDelta };
+  // embedding 调用失败（如超过每批上限被服务端 400）只跳过开关对比，不拖垮后面的起草段与结果文件（#1322）
+  try {
+    const rowVectors = await embedBatched(rowTexts.map(([, text]) => text));
+    const queries = GOLDEN_ALL.map(g => [g.id, g.retrieval.query] as const);
+    const queryVectors = await embedBatched(queries.map(([, query]) => query));
+    const vectors: RetrievalVectors = {
+      rows: new Map(rowTexts.map(([hash], i) => [hash, rowVectors[i]!])),
+      queries: new Map(queries.map(([id], i) => [id, queryVectors[i]!])),
+    };
+    const on = split(retrievalRows(GOLDEN_ALL, vectors));
+    console.log(`\n开关对比：embedding 模型 ${provider.model}，向量关 / 向量开`);
+    table('调参集（向量关）', retrieval.tuning);
+    table('调参集（向量开）', on.tuning);
+    table('验收集（向量关）', retrieval.holdout);
+    table('验收集（向量开）', on.holdout);
+    const recallDelta = {
+      tuning: on.tuning.合计.recall === null || retrieval.tuning.合计.recall === null ? null : on.tuning.合计.recall - retrieval.tuning.合计.recall,
+      holdout: on.holdout.合计.recall === null || retrieval.holdout.合计.recall === null ? null : on.holdout.合计.recall - retrieval.holdout.合计.recall,
+    };
+    console.log(`合计 Recall@20 差值（开 − 关）：调参集 ${pp(recallDelta.tuning)}、验收集 ${pp(recallDelta.holdout)}`);
+    retrievalHybrid = { off: retrieval, on, recallDelta };
+  } catch (e) {
+    if (!(e instanceof LlmError)) throw e;
+    console.log(`\n开关对比：embedding 调用失败，跳过：${e.message}`);
+  }
 }
 
 const STAGE_LABEL: Record<FailStage, string> = { model: '模型调用', definition: '定义校验', unsupported: '模型判断做不到' };
