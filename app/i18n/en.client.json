@@ -562,6 +562,7 @@
   "变动类型": "Change Type",
   "变化": "Change",
   "口径声明": "Semantic claim",
+  "另有构建器表达不了的项：{keys}，以 YAML 与下方 SQL 为准。": "Also has items the builder can't express: {keys}. Trust the YAML and the SQL below.",
   "只合并这个映射已发布的最新版本": "Merge only this mapping's latest published version",
   "只在本页显示一次，离开或刷新后不再保留。": "Shown only once on this page; it is gone once you leave or refresh.",
   "只换模型名时留空；填写后平台请求「端点/chat/completions」。": "Leave empty when only changing the model name; when filled in, the platform requests “endpoint/chat/completions”.",
