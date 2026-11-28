@@ -1,7 +1,8 @@
 // test/pipeline/workbench-ai.test.ts —— 工作台 AI 起草 SQL 的流水线接缝（ADR-0043）：成员 draftWorkbenchSql(需求) → 按本人能读的目录请求模型 →
 // 在只读挂载上按工作台白名单校验（不执行）→ 返回的 SQL 与审计 workbench.ai_drafted { sql, valid }，没有 workbench.query；
-// 结果解读 previewInterpretation / interpretResult(SQL) → 服务端重新执行、剔除系统列、名字像敏感字段的列与取值是哈希的列 → 请求体与审计 workbench.result_interpreted
+// 结果解读 previewInterpretation / interpretResult(SQL) → 服务端重新执行、剔除系统列、名字像敏感字段的列、取值是哈希的列与起别名躲过列名规则的派生敏感列（#1318）→ 请求体与审计 workbench.result_interpreted
 import { and, eq } from 'drizzle-orm';
+import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { listAuditLogs } from '../../app/.server/audit';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -14,6 +15,8 @@ import { listCatalog } from '../../app/.server/workbench';
 import { memberOf, onLake } from './fixtures';
 import { publishedIdentitySources } from './identity-fixtures';
 import { fakeLlm, json, platformDefault } from './llm-fixtures';
+import { sensitiveOutputs } from '../../app/.server/pipeline/sql-refs';
+import { SENSITIVE_NAME } from '../../app/lib/sensitive';
 
 let acme: string;
 afterAll(async () => { await closeDb(); });
@@ -336,6 +339,33 @@ describe('AI 解读结果', () => {
     expect(JSON.stringify(await interpreted(sql))).not.toMatch(HASH);
   });
 
+  // 不依赖种子表有没有明文敏感列：用 CTE 字面量造一行生日、城市与掩码手机号
+  const C = "WITH c AS (SELECT DATE '1990-05-17' AS birthday, 'sh' AS city, '138****0000' AS x_mobile_mask)";
+
+  it.each([
+    ['结果列直接起别名', `${C} SELECT birthday AS d, city FROM c`, 'd', '1990-05-17'],
+    ['CTE 里的别名再被外层引用', `${C}, t AS (SELECT birthday AS d, city FROM c) SELECT d, city FROM t`, 'd', '1990-05-17'],
+    ['掩码手机号列起别名', `${C} SELECT x_mobile_mask AS m, city FROM c`, 'm', '138****0000'],
+  ])('明文敏感字段起了别名（%s）也剔除：预览与确认的 dropped 都含别名，发出的行里没有明文取值', async (_, sql, alias, value) => {
+    await setSamples(true);
+    const { received } = modelSays('客户分布在几个城市');
+
+    expect(await previewInterpretation(await analyst(), sql)).toMatchObject({ sent: ['city'], dropped: [alias] });
+    const out = await interpretResult(await analyst(), sql, true, null);
+    expect(out).toMatchObject({ columns: ['city'], dropped: [alias] });
+    // 生日 / 手机号取值只允许出现在 SQL 文本里（成员自己写的），发出的结果行里不能有
+    const content = sentContent(received[0].body);
+    expect(content.columns).toEqual([{ name: 'city', type: 'VARCHAR' }]);
+    expect(JSON.stringify(content.rows)).not.toContain(value);
+  });
+
+  it('只在 WHERE / GROUP BY 里引用敏感列、结果列本身不含它的照常发送', async () => {
+    await setSamples(true);
+    const sql = `${C} SELECT city, count(*) n FROM c WHERE birthday IS NOT NULL GROUP BY 1`;
+
+    expect(await previewInterpretation(await analyst(), sql)).toMatchObject({ sent: ['city', 'n'], dropped: [] });
+  });
+
   it('名字像敏感字段的列与系统列剔除；全部被剔除时 400，不请求模型', async () => {
     const { f } = modelSays('x');
     expect(await previewInterpretation(await analyst(), "SELECT 'a' AS contact_x, 1 AS _hash, 2 AS k")).toMatchObject({ sent: ['k'], dropped: ['contact_x', '_hash'] });
@@ -489,5 +519,38 @@ describe('AI 解读结果', () => {
     expect(logged).toHaveLength(2);
     expect(logged.map(row => row.actorEmail)).toEqual([me.email, me.email]);
     expect(logged[0]!.turnId).not.toBe(logged[1]!.turnId);
+  });
+});
+
+describe('sensitiveOutputs（解析树里由敏感源列算出的输出列）', () => {
+  // 纯函数用例：开一个 :memory: DuckDB 拿 json_serialize_sql 的解析树（与 checkWorkbenchSql 同一来源；
+  // 按 DuckDB 1.5.5 的解析树核对过：select 项的 alias / column_names、CTE 的 aliases、子查询表引用的 column_name_alias）
+  let instance: DuckDBInstance;
+  let con: DuckDBConnection;
+  beforeAll(async () => { instance = await DuckDBInstance.create(':memory:'); con = await instance.connect(); });
+  afterAll(() => { con?.closeSync(); instance?.closeSync(); });
+
+  const outputs = async (sql: string) => {
+    const { j } = (await con.runAndReadAll(`SELECT json_serialize_sql('${sql.replace(/'/g, "''")}') AS j`)).getRowObjectsJson()[0] as { j: string };
+    return sensitiveOutputs(JSON.parse(j).statements, n => SENSITIVE_NAME.test(n));
+  };
+  /** 断言 sql 的敏感输出列恰好是 names（小写；集合不分先后，排序后比） */
+  const just = async (sql: string, names: string[]) => expect((await outputs(sql)).sort()).toEqual([...names].sort());
+
+  it('引用敏感源列的别名输出被算出，普通列与聚合不受影响', async () => {
+    await just('SELECT birthday AS d, city FROM silver.customer', ['d']);
+    await just('SELECT city, count(*) AS n FROM silver.customer', []);
+  });
+
+  it('子查询与 CTE 的别名链、CTE 列别名表、集合运算都能追上', async () => {
+    await just('SELECT d FROM (SELECT birthday AS d FROM silver.customer) AS x', ['d']);
+    await just('WITH t AS (SELECT birthday AS d FROM silver.customer) SELECT d FROM t', ['d']);
+    await just('WITH t(b) AS (SELECT birthday FROM silver.customer) SELECT b FROM t', ['birthday', 'b']);
+    await just("SELECT name AS n FROM silver.customer UNION ALL SELECT birthday FROM silver.customer", ['birthday', 'n']);
+  });
+
+  it('别名表里有一个输出敏感时整张表的名字都算敏感（宁可多剔）', async () => {
+    // 集合不分作用域：CTE 内部的输出名 birthday 也在集合里（sendable 只拿它对结果列名，多剔无害）
+    await just('SELECT b, c FROM (SELECT birthday, city FROM silver.customer) AS x(b, c)', ['birthday', 'b', 'c']);
   });
 });

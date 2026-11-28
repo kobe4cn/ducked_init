@@ -11,8 +11,9 @@
 // 盐放在默认库 memory 的一张表里由视图读取，不写进视图定义（EXPLAIN 会展开视图）；lake.bronze_* 照旧拒绝
 import type { DuckDBConnection } from '@duckdb/node-api';
 import { bronzeTablesOf, createMaskedViews } from './source-view-engine';
-import { collectRefs, normalizeSql } from './sql-refs';
+import { collectRefs, normalizeSql, sensitiveOutputs } from './sql-refs';
 import { bronzeSchema, currentStateOf } from './sync-engine';
+import { SENSITIVE_NAME } from '../../lib/sensitive';
 
 /** 可以展示给成员的 SQL 问题 */
 export class WorkbenchSqlError extends Error {}
@@ -39,15 +40,18 @@ export interface SandboxAccess { sandbox?: string; shared?: readonly SandboxTabl
 
 /**
  * 校验通过的查询：sql 是实际执行的语句（SHOW TABLES 换成只列能读的 schema 的查询）；
- * savable 为真时它是一条 SELECT / WITH（不是 EXPLAIN、DESCRIBE、SHOW、SUMMARIZE），可以保存为沙箱表
+ * savable 为真时它是一条 SELECT / WITH（不是 EXPLAIN、DESCRIBE、SHOW、SUMMARIZE），可以保存为沙箱表；
+ * sensitive 是结果列里由敏感源列算出的列名（小写，sensitiveOutputs 按解析树追别名链）
  */
-export interface CheckedQuery { sql: string; savable: boolean }
+export interface CheckedQuery { sql: string; savable: boolean; sensitive: string[] }
 
 export interface WorkbenchResult {
   columns: { name: string; type: string }[];
   rows: unknown[][];
   /** 结果超过 limit 行，只给出了前 limit 行 */
   truncated: boolean;
+  /** 结果列里由敏感列算出的列名（小写），见 sql-refs.ts 的 sensitiveOutputs；结果解读按它剔别名改名的敏感列 */
+  sensitive?: readonly string[];
 }
 
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`;
@@ -114,7 +118,8 @@ export async function checkWorkbenchSql(con: DuckDBConnection, sql: string, { sa
   if (tree.statements?.length !== 1) throw new WorkbenchSqlError(ALLOWED_STATEMENTS);
   if (!explain) {
     const listed = showTablesOf(tree.statements[0], schemas, hint);
-    if (listed) return { sql: listTablesSql(listed.schemas, listed.all ? shared : [], sandbox), savable: false };
+    // SHOW 换成的查询结果列是 schema、表名等，不是数据，没有由敏感列算出的输出
+    if (listed) return { sql: listTablesSql(listed.schemas, listed.all ? shared : [], sandbox), savable: false, sensitive: [] };
   }
   const found = collectRefs(tree.statements, { allowedShows: ALLOWED_SHOWS });
   if (found.forbidden.length) throw new WorkbenchSqlError(`不能用 ${[...new Set(found.forbidden)].join('、')}，${hint}的表`);
@@ -137,7 +142,7 @@ export async function checkWorkbenchSql(con: DuckDBConnection, sql: string, { sa
         : `表 ${t.table} 要写明 schema，如 silver.${t.table}（${hint}）`);
     }
   }
-  return { sql, savable: !explain && !isShow(tree.statements[0]) };
+  return { sql, savable: !explain && !isShow(tree.statements[0]), sensitive: sensitiveOutputs(tree.statements, n => SENSITIVE_NAME.test(n)) };
 }
 
 /** 目录树里的一张表：schema、表名、行数（DuckLake 登记的估计值）与按顺序的字段 */
@@ -239,6 +244,7 @@ export async function runWorkbenchQuery(con: DuckDBConnection, query: CheckedQue
     columns: names.map((name, i) => ({ name, type: types[i].toString() })),
     rows: rows.slice(0, limit),
     truncated: rows.length > limit,
+    sensitive: query.sensitive,
   };
 }
 

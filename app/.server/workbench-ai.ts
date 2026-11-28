@@ -4,7 +4,7 @@
 // 审计 workbench.ai_drafted 记 SQL 与是否通过校验，不记需求原文；模型判断做不到时（需要的表不在目录里、要写数据）422 给出它的原因，审计只记 { unsupported: true }；不自动重试。成功时可带模型的口径假设 notes（最多 MAX_NOTES 条）给页面列出，notes 不进审计。
 // 结果解读：成员确认后服务端按 SQL 重新执行（不信客户端传来的行），租户打开「发送脱敏样本」时把前 INTERPRET_ROWS 行发给模型服务，
 // 没打开时只发 SQL、列名与类型、行数和每列统计（按全部结果行算），不发任何行；结果列无法回溯到字段，
-// 所以按列名与取值保守剔除系统列、名字像敏感字段的列与取值里有 64 位十六进制哈希的列（统计也只算留下的列）。审计 workbench.result_interpreted 不记取值，记 samples；
+// 所以按列名与取值保守剔除系统列、名字像敏感字段的列与取值里有 64 位十六进制哈希的列，再按解析树算出的派生敏感列（sensitiveOutputs）剔掉起别名躲过列名规则的列（#1318）（统计也只算留下的列）。审计 workbench.result_interpreted 不记取值，记 samples；
 // 两种提示都带 SQL 与服务端按全部返回行算好的数值事实（合计、最大、最小、占比，模型只能引用这些数）；按 isDetail 区分分组汇总（可点名分组，事实带所在行）与明细（不点名、只谈分布，不带所在行），关闭开关时也不带所在行；
 // 模型不一定照做：解读里的数字逐个在发出去的 user 消息里找出处（uncitedNumbers），找不到的只返回给页面标出、不重写，审计只记个数；
 // 解读连同 SQL、行数与发送的列名存进本人的助手对话（appendInterpretation），不存结果行
@@ -215,11 +215,17 @@ const cellText = (v: unknown): string | null =>
     : typeof v === 'object' ? JSON.stringify(v, (_, x) => (typeof x === 'bigint' ? x.toString() : x))
       : String(v);
 
-/** 每列发不发：系统列、名字像敏感字段的列、前 limit 行里有取值含哈希的列都不发（按位置，重名的列也不会取错） */
-const sendable = (result: WorkbenchResult, limit = INTERPRET_ROWS): boolean[] => {
+/** 空的派生敏感列集合：没算过（如 MCP 的 run_query）时 sendable 的默认值 */
+const NONE = new Set<string>();
+
+/** 结果列里由敏感源列算出的列名（workbench-engine 校验时按解析树算出，追别名链，#1318） */
+const derivedOf = (result: WorkbenchResult): ReadonlySet<string> => new Set(result.sensitive ?? []);
+
+/** 每列发不发：系统列、名字像敏感字段的列、由敏感源列算出的列（起个别名也躲不过）、前 limit 行里有取值含哈希的列都不发（按位置，重名的列也不会取错） */
+const sendable = (result: WorkbenchResult, limit = INTERPRET_ROWS, derived: ReadonlySet<string> = NONE): boolean[] => {
   const rows = result.rows.slice(0, limit);
   return result.columns.map(({ name }, i) =>
-    !isSystemColumn(name) && !looksSensitive({ name }) && !rows.some(row => HASH.test(cellText(row[i]) ?? '')));
+    !isSystemColumn(name) && !looksSensitive({ name }) && !derived.has(name.toLowerCase()) && !rows.some(row => HASH.test(cellText(row[i]) ?? '')));
 };
 
 /** 列名像标识（customer_id、openid、unionid、mobile）；`(^|_)id$` 不误伤 paid */
@@ -243,10 +249,10 @@ export function pickColumns(result: WorkbenchResult, keep = sendable(result)): {
 
 /**
  * 剔除后交出去的结果：前 limit 行里没被剔除的列，单元格转成字符串、每格最多 MAX_CELL 字；dropped 是剔除的列名。
- * 哈希按交出去的这些行判断：解读只发前 INTERPRET_ROWS 行，MCP 的 run_query 交出全部行（limit 传 Infinity）
+ * 哈希按交出去的这些行判断：解读只发前 INTERPRET_ROWS 行，MCP 的 run_query 交出全部行（limit 传 Infinity，不传 derived，行为不变）
  */
-export function redactResult(result: WorkbenchResult, limit = INTERPRET_ROWS): { columns: WorkbenchResult['columns']; rows: (string | null)[][]; dropped: string[] } {
-  const keep = sendable(result, limit);
+export function redactResult(result: WorkbenchResult, limit = INTERPRET_ROWS, derived: ReadonlySet<string> = NONE): { columns: WorkbenchResult['columns']; rows: (string | null)[][]; dropped: string[] } {
+  const keep = sendable(result, limit, derived);
   const indexes = keep.flatMap((k, i) => (k ? [i] : []));
   return {
     columns: indexes.map(i => result.columns[i]),
@@ -329,8 +335,9 @@ export async function previewInterpretation(
   assertCan(actor, 'sandbox');
   const samples = await samplesAllowed(actor.tenant.id);
   const result = await rerun(actor, sql);
-  if (!samples) return { rows: result.rows.length, ...pickColumns(result, sendable(result, Infinity)), samples, result };
-  return { rows: sentRows(result), ...pickColumns(result), samples, result };
+  const derived = derivedOf(result);
+  if (!samples) return { rows: result.rows.length, ...pickColumns(result, sendable(result, Infinity, derived)), samples, result };
+  return { rows: sentRows(result), ...pickColumns(result, sendable(result, INTERPRET_ROWS, derived)), samples, result };
 }
 
 /** 两种结果都适用的写作要求 */
@@ -382,12 +389,14 @@ export function interpretRequest(
   let messages: LlmMessage[];
   let sent: string[];
   let dropped: string[];
+  // 派生敏感列（起别名的敏感源列）在这里同样剔除；评测直接构造 WorkbenchResult 时没有 sensitive，集合为空、行为不变
+  const derived = derivedOf(result);
   // 数值事实按全部返回行、用比发样本更严的 keep 算：标签列取值来自第 INTERPRET_ROWS 行之后也不会带出哈希；不发样本时不带所在行
-  const factKeep = sendable(result, Infinity);
+  const factKeep = sendable(result, Infinity, derived);
   const detail = isDetail(result, factKeep);
   const facts = numericFacts(result, factKeep, detail || !samples);
   if (samples) {
-    const redacted = redactResult(result);
+    const redacted = redactResult(result, INTERPRET_ROWS, derived);
     ({ dropped } = redacted);
     sent = redacted.columns.map(c => c.name);
     messages = interpretMessages(normalized, redacted, result.truncated, detail, facts);
