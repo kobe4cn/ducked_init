@@ -526,7 +526,7 @@ export async function listAuditLogs(tenantId: string, action?: string) {
   const rows = await getDb()
     .select()
     .from(auditLogs)
-    .where(actionCond ? and(eq(auditLogs.tenantId, tenantId), actionCond) : eq(auditLogs.tenantId, tenantId))
+    .where(and(eq(auditLogs.tenantId, tenantId), actionCond))
     .orderBy(desc(auditLogs.createdAt), desc(auditLogs.id))
     .limit(AUDIT_PAGE_SIZE);
   return rows.map(present);

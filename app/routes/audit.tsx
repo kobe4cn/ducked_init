@@ -39,6 +39,7 @@ export default function Audit({ loaderData }: Route.ComponentProps) {
       <Form method="get" preventScrollReset className="mb-4 flex max-w-2xl items-center gap-2">
         <label htmlFor="audit-action" className="text-sm text-slate-500">{t('按动作筛选')}</label>
         <select
+          key={action ?? ''}
           id="audit-action"
           name="action"
           defaultValue={action ?? ''}
