@@ -1,9 +1,11 @@
 // test/pipeline/model-draft.test.ts —— 模型输出转映射 YAML（纯函数，ADR-0035）：以规则草稿为底换掉 fields / dedupe / identity，字典数组转对象，理由成行尾注释；
-// 个别项不过校验时去掉这些项（退回规则草稿里的同名项，没有就删掉）；模型建议的断言只换 assertions 块
+// 个别项不过校验时去掉这些项（退回规则草稿里的同名项，没有就删掉）；模型建议的断言只换 assertions 块；
+// 起草提示词（#1321）：非 customer 实体不列 identity 的输出格式与规则，模型多写的 identity 忽略
 import { parse, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { dropAssertions, ruleAssertions } from '../../app/.server/pipeline/assertion-fallback';
-import { assertionsToYaml, dropItems, modelOutputToYaml, type AssertionDraft, type ModelDraft } from '../../app/.server/pipeline/model-draft';
+import type { TableContext } from '../../app/.server/pipeline/llm-context';
+import { assertionsToYaml, dropItems, modelDraftMessages, modelOutputToYaml, type AssertionDraft, type ModelDraft } from '../../app/.server/pipeline/model-draft';
 import type { MappingIssue, MergePlan } from '../../app/.server/pipeline/mapping-spec';
 import type { TableProfile } from '../../app/.server/pipeline/source-engine';
 import { readForm } from '../../app/lib/mapping-form';
@@ -24,6 +26,9 @@ extensions:
 #   channel
 `;
 
+/** entity 换成 customer 的版本：identity 只对 customer 写入（#1321） */
+const RULES_CUSTOMER = RULES.replace('entity: order', 'entity: customer');
+
 const OUT: ModelDraft = {
   fields: [
     { field: 'order_id', expr: 'string(order_id)', confidence: 0.95, reason: '源表主键\n与实体主键同名' },
@@ -31,6 +36,32 @@ const OUT: ModelDraft = {
     { field: 'amount', expr: 'amount', confidence: 0.6, reason: '金额列' },
   ],
 };
+
+/** order 草稿但规则草稿里带 identity：非 customer 时模型的 identity 忽略、规则草稿里的照常删掉（#1321） */
+const RULES_ID_ORDER = `${RULES}identity:
+  match: [email]
+`;
+
+describe('起草提示词', () => {
+  /** 与 scripts/eval-mapping/report.ts 的 EMPTY_CONTEXT 一样：提示词不看具体表 */
+  const CTX: TableContext = { table: '', rows: 0, primaryKey: [], keyCandidates: [], columns: [] };
+
+  it('非 customer 实体的 system 不列 identity 的输出格式与规则，customer 时两样都在（#1321）', () => {
+    const DEDUPE = '  "dedupe"?: { "key": [字段名], "latest"?: 字段名, "confidence", "reason" }';
+    for (const entity of ['order', 'event', 'membership']) {
+      const system = modelDraftMessages(CTX, entity, '').find(m => m.role === 'system')!.content;
+      expect(system).not.toContain('"identity"');
+      expect(system).not.toContain('identity 只用于 customer');
+      // 没有 identity 格式行时，dedupe 行以 } } 闭合输出格式对象
+      expect(system).toContain(`${DEDUPE} }`);
+    }
+    const customer = modelDraftMessages(CTX, 'customer', '').find(m => m.role === 'system')!.content;
+    expect(customer).toContain('"identity"');
+    expect(customer).toContain('identity 只用于 customer');
+    // customer 的 dedupe 行以逗号结尾，下一行是 identity 的输出格式
+    expect(customer).toContain(`${DEDUPE},\n  "identity"?: { "match": [字段名，按优先级], "confidence", "reason" } }`);
+  });
+});
 
 describe('模型输出转映射 YAML', () => {
   it('保留 table、entity、extensions 等顶层键，fields 整体换成模型给的，字典数组转成对象', () => {
@@ -49,7 +80,7 @@ describe('模型输出转映射 YAML', () => {
 
   it('没给 dedupe / identity 时删掉规则草稿里的，给了时写入；items 记下每项的置信度与理由', () => {
     expect(parse(modelOutputToYaml(RULES, OUT).yaml)).not.toHaveProperty('dedupe');
-    const { yaml, items } = modelOutputToYaml(RULES, {
+    const { yaml, items } = modelOutputToYaml(RULES_CUSTOMER, {
       ...OUT,
       dedupe: { key: ['order_id', 'amount'], latest: 'amount', confidence: 0.5, reason: '同一订单多行' },
       identity: { match: ['order_id'], confidence: 0.3, reason: '试试' },
@@ -65,6 +96,15 @@ describe('模型输出转映射 YAML', () => {
     ]);
   });
 
+  it('非 customer 实体忽略模型的 identity：不写进 YAML、不进 items，规则草稿里的 identity 也删掉（#1321）', () => {
+    // RULES_ID_ORDER：规则草稿里有 identity 的 order 草稿，identity 也照常删掉
+    for (const rules of [RULES, RULES_ID_ORDER]) {
+      const { yaml, items } = modelOutputToYaml(rules, { ...OUT, identity: { match: ['email'], confidence: 0.4, reason: '试试' } });
+      expect(parse(yaml)).not.toHaveProperty('identity');
+      expect(items.map(i => i.path)).not.toContain('identity');
+    }
+  });
+
   it('理由写成表达式的行尾注释（换行压成一行），表单把它显示为依据', () => {
     const { yaml } = modelOutputToYaml(RULES, OUT);
     expect(yaml).toContain('order_id: string(order_id) # 源表主键 与实体主键同名');
@@ -77,10 +117,10 @@ describe('模型输出转映射 YAML', () => {
 describe('校验问题落在个别项时去掉这些项', () => {
   const issue = (path: string, message: string): MappingIssue => ({ line: 2, col: 3, path, message });
 
-  /** 规则草稿里带 identity 的版本（identity 退回规则草稿用） */
+  /** 规则草稿里带 identity 的 customer 版本（identity 退回规则草稿用；dropItems 不校验实体，#1321 后 identity 的写入只对 customer） */
   const RULES_ID = `# 按规则生成的草稿
 model: 1
-entity: order
+entity: customer
 table: orders
 fields:
   order_id: string(order_id) # 同名列
@@ -133,9 +173,9 @@ identity:
     expect(parse(deleted.yaml)).not.toHaveProperty('dedupe');
     expect(deleted.items[3]).toMatchObject({ path: 'dedupe', dropped: '取最新字段 amount 应为时间、日期或数字' });
 
-    // RULES 有 dedupe、没有 identity：dedupe 退回规则草稿，identity 删掉
-    const b = modelOutputToYaml(RULES, OUT_FULL);
-    const both = dropItems(RULES, b.yaml, b.items, [issue('dedupe.latest', '取最新字段 amount 应为时间、日期或数字'), issue('identity', '只有消费者（customer）映射能配置身份打通的匹配规则')])!;
+    // RULES 有 dedupe、没有 identity：dedupe 退回规则草稿，identity 删掉（identity 的写入用 customer 草稿，#1321）
+    const b = modelOutputToYaml(RULES_CUSTOMER, OUT_FULL);
+    const both = dropItems(RULES_CUSTOMER, b.yaml, b.items, [issue('dedupe.latest', '取最新字段 amount 应为时间、日期或数字'), issue('identity', '只有消费者（customer）映射能配置身份打通的匹配规则')])!;
     const spec = parse(both.yaml);
     expect(spec.dedupe).toEqual({ key: ['order_id'] });
     expect(spec).not.toHaveProperty('identity');

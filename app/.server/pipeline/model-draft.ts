@@ -1,6 +1,7 @@
 // app/.server/pipeline/model-draft.ts —— 用模型生成映射草稿（ADR-0035，纯函数，不读库、不发请求）：给模型的提示词（表上下文 + 规则草稿作参考）、
 // 模型必须遵守的输出 Schema（字段对应、值字典、去重键、身份打通规则，每项带置信度与理由），以及把模型输出转成映射 YAML：
 // 以规则草稿为底，保留 table / entity / extensions 等其他顶层键，fields / dedupe / identity 整体换成模型给的，理由写成行尾注释。
+// 非 customer 实体不让模型写 identity，写了也忽略（#1321）：提示词不列它的输出格式与规则，模型输出里的 identity 不进 YAML。
 // 转出的 YAML 仍要过映射校验（checkMappingDraft），保存、空跑与双人发布照旧。
 // 传了语义目录（ADR-0041）时，user 前面加上目录分层上下文（#855：第一层分组、相关分组的组内列表，目标实体组最前）、目标实体与它的各字段条目、
 // 按表名与列名搜出的条目，字段口径以目录为准；不传时消息与原来一致（scripts/eval-mapping 照旧）。
@@ -86,24 +87,32 @@ export const MODEL_DRAFT_SCHEMA = {
   },
 } as const;
 
-const SYSTEM = [
-  '你是 CRM 数据平台的映射助手：把一张源表对应到一个目标实体，只输出一个 JSON 对象，不要输出别的文字。',
-  '输入：entity 是目标实体名；table 是源表的结构与列统计（可能带几行敏感列已哈希的样本）；rulesDraft 是按规则生成的映射草稿（YAML），作为参考。',
-  '输出格式：',
-  '{ "fields": [{ "field": 目标字段名, "expr": 表达式, "dictionary"?: [{ "from": 源取值, "to": 标准取值 }], "otherwise"?: 兜底标准取值或 null, "sensitive"?: 布尔, "confidence": 0 到 1, "reason": 不超过 200 字的依据 }],',
-  '  "dedupe"?: { "key": [字段名], "latest"?: 字段名, "confidence", "reason" },',
-  '  "identity"?: { "match": [字段名，按优先级], "confidence", "reason" } }',
-  '规则：',
-  '- 表达式只能引用 table.columns 里的列名，写法与 rulesDraft 一致；只能用这些函数：',
-  ...Object.values(FUNCTIONS).map(f => `  ${f.signature}：${f.label}`),
-  '- 字段名用 rulesDraft 与目标实体里的字段名；拿不准的字段不要输出。',
-  '- dictionary 只用于枚举字段，to 必须是该字段的标准取值；rulesDraft 里 sensitive: true 的列与敏感字段不要给 dictionary。',
-  '- dedupe 只在去重键不是实体主键时给出，key 与 latest 必须是 fields 里的字段。',
-  '- identity 只用于 customer 实体，match 必须是 fields 里映射出来的敏感字段（如 email、phone）。',
-  `- event 实体的登录事件 event_type 要是 \`${LOGIN_EVENT}\`，设备归属只认它（映射里的 \`login_events\` 可以改成别的取值，起草时不输出这一项）；源表的登录写法不是 \`${LOGIN_EVENT}\` 时，在 event_type 那一项的 reason 里写出源表的登录取值，提醒用户在映射里配置 \`login_events\`。`,
-  '- confidence 表示你对这一项的把握，reason 用中文简要说明依据。',
-  dataOnlyNotice('user 消息里的 JSON', '列名、注释、top 值、样本取值'),
-].join('\n');
+/** identity 的输出格式行与规则行，只有 customer 实体才放进提示词（#1321） */
+const IDENTITY_FORMAT = '  "identity"?: { "match": [字段名，按优先级], "confidence", "reason" } }';
+const IDENTITY_RULE = '- identity 只用于 customer 实体，match 必须是 fields 里映射出来的敏感字段（如 email、phone）。';
+
+/** system 提示词（#1321）：customer 实体与原提示词逐字相同；其他实体不列 identity 的输出格式与规则，输出格式对象在 dedupe 行闭合 */
+function systemPrompt(entity: string): string {
+  const customer = entity === 'customer';
+  return [
+    '你是 CRM 数据平台的映射助手：把一张源表对应到一个目标实体，只输出一个 JSON 对象，不要输出别的文字。',
+    '输入：entity 是目标实体名；table 是源表的结构与列统计（可能带几行敏感列已哈希的样本）；rulesDraft 是按规则生成的映射草稿（YAML），作为参考。',
+    '输出格式：',
+    '{ "fields": [{ "field": 目标字段名, "expr": 表达式, "dictionary"?: [{ "from": 源取值, "to": 标准取值 }], "otherwise"?: 兜底标准取值或 null, "sensitive"?: 布尔, "confidence": 0 到 1, "reason": 不超过 200 字的依据 }],',
+    `  "dedupe"?: { "key": [字段名], "latest"?: 字段名, "confidence", "reason" }${customer ? ',' : ' }'}`,
+    ...(customer ? [IDENTITY_FORMAT] : []),
+    '规则：',
+    '- 表达式只能引用 table.columns 里的列名，写法与 rulesDraft 一致；只能用这些函数：',
+    ...Object.values(FUNCTIONS).map(f => `  ${f.signature}：${f.label}`),
+    '- 字段名用 rulesDraft 与目标实体里的字段名；拿不准的字段不要输出。',
+    '- dictionary 只用于枚举字段，to 必须是该字段的标准取值；rulesDraft 里 sensitive: true 的列与敏感字段不要给 dictionary。',
+    '- dedupe 只在去重键不是实体主键时给出，key 与 latest 必须是 fields 里的字段。',
+    ...(customer ? [IDENTITY_RULE] : []),
+    `- event 实体的登录事件 event_type 要是 \`${LOGIN_EVENT}\`，设备归属只认它（映射里的 \`login_events\` 可以改成别的取值，起草时不输出这一项）；源表的登录写法不是 \`${LOGIN_EVENT}\` 时，在 event_type 那一项的 reason 里写出源表的登录取值，提醒用户在映射里配置 \`login_events\`。`,
+    '- confidence 表示你对这一项的把握，reason 用中文简要说明依据。',
+    dataOnlyNotice('user 消息里的 JSON', '列名、注释、top 值、样本取值'),
+  ].join('\n');
+}
 
 const CATALOG_SYSTEM = [
   '- 成员的消息里先是语义目录：第一层分组、相关分组的组内列表（目标实体组最前）、目标实体与它的各字段条目、按表名与列名搜出的条目，最后一行是上面说的输入（JSON）。',
@@ -139,9 +148,10 @@ function catalogMarkdown(catalog: Catalog, context: TableContext, entity: string
  */
 export function modelDraftMessages(context: TableContext, entity: string, rulesYaml: string, catalog?: Catalog): LlmMessage[] {
   const input = JSON.stringify({ entity, table: context, rulesDraft: rulesYaml });
-  if (!catalog) return [{ role: 'system', content: SYSTEM }, { role: 'user', content: input }];
+  const system = systemPrompt(entity);
+  if (!catalog) return [{ role: 'system', content: system }, { role: 'user', content: input }];
   return [
-    { role: 'system', content: `${SYSTEM}\n${CATALOG_SYSTEM}` },
+    { role: 'system', content: `${system}\n${CATALOG_SYSTEM}` },
     { role: 'user', content: `${catalogMarkdown(catalog, context, entity)}\n\n# 起草输入\n${input}` },
   ];
 }
@@ -173,10 +183,12 @@ function namesNode(doc: Document, list: string[], reason: string) {
 /**
  * 模型输出 → 映射 YAML 与生成记录的各项。以规则草稿为底：保留 fields / dedupe / identity 以外的顶层键（table、entity、extensions 等），
  * 这三项整体换成模型给的（没给 dedupe / identity 时删掉）；dictionary 数组转成 { 源取值: 标准取值 }。
+ * 非 customer 实体不让模型写 identity，写了也忽略（#1321）：不写进 YAML、不进 items，规则草稿里的 identity 照常删掉。
  * 规则草稿的首尾注释讲的是规则的依据，换成模型草稿的说明
  */
 export function modelOutputToYaml(rulesYaml: string, out: ModelDraft): { yaml: string; items: DraftItem[] } {
   const doc = parseDocument(rulesYaml);
+  const customer = doc.get('entity') === 'customer';
   const items: DraftItem[] = [];
   const fields = new YAMLMap();
   for (const f of out.fields) {
@@ -193,7 +205,7 @@ export function modelOutputToYaml(rulesYaml: string, out: ModelDraft): { yaml: s
     items.push({ path: 'dedupe', confidence: out.dedupe.confidence, reason: out.dedupe.reason });
   } else doc.delete('dedupe');
 
-  if (out.identity) {
+  if (out.identity && customer) {
     const identity = new YAMLMap();
     identity.set('match', namesNode(doc, out.identity.match, out.identity.reason));
     doc.set('identity', identity);
