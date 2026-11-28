@@ -1,7 +1,7 @@
 // app/.server/quality.ts —— 数据质量告警（ADR-0026）：结果层任务因 error 级断言失败时，给租户管理员发邮件并记审计；
 // 同一次入队的一组任务（参数里同一个 batchId）只告警一次、只记一条审计（#841），每个任务自己的报错文本照常写。
 // 报错文本、邮件与审计写断言名、实体、不合格行数与来源映射名，并附数据质量页链接；不写键与行内容。数据质量页只读挂载本租户数据湖，读最近的断言运行记录与隔离区样本（只来自标准层，敏感字段只有哈希）；
-// 顶部「最近一次」统计取平台库里最近一次结果层任务的断言结果（合并任务也写运行记录，且 error 失败时回滚不留记录，不能拿湖里最近一条当准）。
+// 顶部「最近一次」统计取平台库里每个结果层任务（每个定义、每个模板任务）最近一次运行的断言结果合并（合并任务也写运行记录，且 error 失败时回滚不留记录，不能拿湖里最近一条当准）。
 // readQuality 可按任务 ID 过滤（#838，定义页的失败提示与告警链到 /quality?task=）；隔离区行 JSON 里的 _mapping 是映射 ID，mappingLabels 给出「源 · 表 → 实体」
 import { and, desc, eq, inArray, isNotNull, like, sql } from 'drizzle-orm';
 import { recordAudit } from './audit';
@@ -71,13 +71,25 @@ export async function alertAssertionFailure(
   }
 }
 
-/** 最近一次跑过断言的结果层任务（gold.*，结果里有 assertions）的任务 ID 与断言结果；还没有时为 undefined */
-export async function latestResultCheck(tenantId: string): Promise<{ taskId: string; assertions: AssertionResult[] } | undefined> {
-  const [task] = await getDb().select({ id: tasks.id, result: tasks.result }).from(tasks)
+/** 每个结果层任务键（kind 加 params 里的 definitionId；模板任务没有 definitionId，就只按 kind）各自最近一次跑过断言（gold.*，
+ *  结果里有 assertions）的运行。一次刷新会扇出很多 gold.dsl（一个定义一个任务），只看最后完成的一个会漏掉同批其他任务的失败（#1329）。
+ *  返回覆盖的任务数、有失败断言的任务里最近完成的一个的任务 ID（提示链到 ?task= 用）与合并后的断言结果；还没有时为 undefined */
+export async function latestResultCheck(tenantId: string): Promise<{ tasks: number; failedTaskId?: string; assertions: AssertionResult[] } | undefined> {
+  // DISTINCT ON 的键：kind 加 params->>'definitionId'（模板任务的 params 里没有这一项，NULL 之间按相同处理，就只按 kind）；
+  // orderBy 必须以 DISTINCT ON 的表达式开头，键内再按 finished_at 倒序：每个任务键各取最近一次完成的
+  const rows = await getDb().selectDistinctOn([tasks.kind, sql`${tasks.params} ->> 'definitionId'`], { id: tasks.id, finishedAt: tasks.finishedAt, result: tasks.result })
+    .from(tasks)
     .where(and(eq(tasks.tenantId, tenantId), like(tasks.kind, 'gold.%'), isNotNull(tasks.finishedAt), sql`${tasks.result} -> 'assertions' IS NOT NULL`))
-    .orderBy(desc(tasks.finishedAt)).limit(1);
+    .orderBy(tasks.kind, sql`${tasks.params} ->> 'definitionId'`, desc(tasks.finishedAt));
+  if (!rows.length) return undefined;
   // 查询按 gold.% 匹配，模板任务（gold.rfm/…）与 gold.expire 也会进来：只借 gold.dsl 的结果类型读，不带 kind（#477）
-  return task && { taskId: task.id, assertions: readResult('gold.dsl', { result: task.result })!.assertions };
+  const runs = rows.map(r => ({ id: r.id, at: r.finishedAt!, assertions: readResult('gold.dsl', { result: r.result })!.assertions }));
+  const failed = runs.filter(r => r.assertions.some(a => a.failed > 0));
+  return {
+    tasks: runs.length,
+    failedTaskId: failed.length ? failed.reduce((a, b) => (a.at > b.at ? a : b)).id : undefined,
+    assertions: runs.flatMap(r => r.assertions),
+  };
 }
 
 const READ_LIMITS = { memoryLimitMb: 256, threads: 1 };

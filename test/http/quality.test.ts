@@ -2,6 +2,7 @@
 // 有 sources:read 的成员在 /quality 看到本租户最近的断言结果（失败标出）与隔离区样本，页面上没有明文；没有该权限的成员 403，其他租户的成员看不到；
 // 最近一次成功打通的 hot（一个值连了太多源记录）在 /quality 列出哈希、记录数与数据源名，customer 映射的合并记录页顶部给出提示；
 // 有 sources:write 的成员把 hot 里的值标为不参与匹配或撤销：登记进平台表、审计只有哈希与记录数，入队带排除列表、强制重算打通的合并
+import { randomUUID } from 'node:crypto';
 import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
@@ -178,7 +179,56 @@ describe('数据质量页', () => {
     expect(html).toContain('自定义：amount 取值范围');
     expect(html).toMatch(/>1(<!-- -->)? 行不合格</);
     expect(html).toMatch(/最近一次阻断失败<\/div><div class="[^"]*">1<\/div>/);
-    expect(html).toContain(`结果层任务 ${task.id}`);
+    // 合并任务的 warn 级自定义断言不计入「最近一次告警」；提示写覆盖的任务数并链到失败任务
+    expect(html).toMatch(/最近一次告警<\/div><div class="[^"]*">0<\/div>/);
+    expect(html).toMatch(/覆盖 (<!-- -->)?1(<!-- -->)? 个结果层任务/);
+    expect(html).toContain(`href="/quality?task=${task.id}"`);
+  });
+
+  it('「最近一次」按每个结果层任务各自最近一次汇总：后完成的任务全部通过时，先完成任务的 warn / 阻断失败仍显示；定义重跑通过后不再计入', async () => {
+    const acme = await newTenant('acme');
+    // 直接造结果层任务的运行记录（latestResultCheck 只读 tasks 表，不跑任务）：断言结果的形状与 gold.dsl 契约一致
+    const at = (min: number) => new Date(Date.now() + min * 60_000);
+    const gold = async (kind: 'gold.dsl' | 'gold.rfm', definitionId: string | null, finishedAt: Date, assertions: unknown[]) =>
+      (await getDb().insert(tasks).values({
+        tenantId: acme, kind, status: 'succeeded', finishedAt,
+        params: { kind: 'metric', sql: 'SELECT 1', entities: ['order'], ...(definitionId ? { definitionId } : {}) },
+        result: { assertions },
+      }).returning())[0];
+    // 两个定义的 gold.dsl 先后完成：先完成的带 warn 与阻断失败，后完成的全部通过（旧实现只看最后完成的这个，两个数都显示 0）
+    const d1 = randomUUID();
+    const first = await gold('gold.dsl', d1, at(0), [
+      { name: 'points_balance', level: 'warn', entity: 'membership', failed: 1 },
+      { name: 'amount_non_negative', level: 'error', entity: 'order', failed: 2 },
+    ]);
+    await gold('gold.dsl', randomUUID(), at(1), [{ name: 'points_balance', level: 'warn', entity: 'membership', failed: 0 }]);
+    // 模板任务没有 definitionId，任务键只按 kind：更早一次的阻断失败被后来通过的运行顶掉，不再计入
+    await gold('gold.rfm', null, at(2), [{ name: 'amount_non_negative', level: 'error', entity: 'order', failed: 1 }]);
+    await gold('gold.rfm', null, at(3), [{ name: 'amount_non_negative', level: 'error', entity: 'order', failed: 0 }]);
+    // 合并任务的自定义断言不计入「最近一次」
+    await getDb().insert(tasks).values({
+      tenantId: acme, kind: 'silver.merge', status: 'succeeded', finishedAt: at(4), params: {},
+      result: { assertions: [{ name: 'custom:amount:range', level: 'warn', entity: 'order', failed: 3 }] },
+    });
+
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const browser = await loginAs(app, 'analyst@acme.com');
+    const html = await (await browser.get('/quality')).text();
+    expect(html).toMatch(/最近一次告警<\/div><div class="[^"]*">1<\/div>/);
+    expect(html).toMatch(/最近一次阻断失败<\/div><div class="[^"]*">1<\/div>/);
+    expect(html).toMatch(/覆盖 (<!-- -->)?3(<!-- -->)? 个结果层任务/);
+    expect(html).toContain(`href="/quality?task=${first.id}"`);
+
+    // first 的定义重跑并通过：只看每个任务键的最近一次，它上一次的失败不再计入，提示不再带失败任务的链接
+    await gold('gold.dsl', d1, at(5), [
+      { name: 'points_balance', level: 'warn', entity: 'membership', failed: 0 },
+      { name: 'amount_non_negative', level: 'error', entity: 'order', failed: 0 },
+    ]);
+    const rerun = await (await browser.get('/quality')).text();
+    expect(rerun).toMatch(/最近一次告警<\/div><div class="[^"]*">0<\/div>/);
+    expect(rerun).toMatch(/最近一次阻断失败<\/div><div class="[^"]*">0<\/div>/);
+    expect(rerun).toMatch(/覆盖 (<!-- -->)?3(<!-- -->)? 个结果层任务/);
+    expect(rerun).not.toContain('href="/quality?task=');
   });
 
   it('按任务筛选：?task= 只看该任务的断言与隔离区，隔离区行显示来源映射并链到映射详情页；映射删了只显 ID；参数不是 UUID 忽略；别的租户用同一 ID 是空', async () => {
