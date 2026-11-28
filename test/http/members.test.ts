@@ -148,6 +148,47 @@ describe('审计日志', () => {
     expect(html).toContain('运营者');
     expect(html).toContain('admin@acme.com');
   });
+
+  it('按动作筛选：精确与前缀只列该动作，不认识的值按全部处理，筛选仍只看本租户', async () => {
+    await tenantWith('viewer', 'globex', '环球零售'); // B 租户也记了邀请成员，带 action 也不该漏进 A 的页面
+    const { admin, memberId } = await tenantWith('viewer');
+    await admin.post('/members', { intent: 'change-role', memberId, role: 'analyst' });
+
+    const actions = async (query = '') =>
+      [...(await (await admin.get(`/audit${query}`)).text()).matchAll(/data-audit-action="([^"]+)"/g)].map(m => m[1]);
+
+    expect(await actions()).toEqual(['修改角色', '邀请成员', '开通租户']);
+    // 精确：只列这一种动作（data-audit-action 放的是中文 label）
+    expect(await actions('?action=member.invited')).toEqual(['邀请成员']);
+    // 前缀：以 . 结尾时列出 member.* 的全部动作
+    expect(await actions('?action=member.')).toEqual(['修改角色', '邀请成员']);
+    // 不认识的值按「全部」处理，不报错；不以 . 结尾的前缀（member）也不算筛选
+    expect(await actions('?action=bogus')).toEqual(['修改角色', '邀请成员', '开通租户']);
+    expect(await actions('?action=member')).toEqual(['修改角色', '邀请成员', '开通租户']);
+    // 带筛选也看不到 B 租户的记录
+    const filtered = await (await admin.get('/audit?action=member.')).text();
+    expect(filtered).not.toContain('globex');
+    expect(filtered).not.toContain('环球零售');
+  });
+
+  it('页头下有按动作筛选的 GET 下拉框：登记过的动作带中文 label，默认与非法值都回显「全部」', async () => {
+    const { admin } = await tenantWith('viewer');
+    const html = await (await admin.get('/audit')).text();
+    expect(html).toMatch(/<form(?=[^>]*action="\/audit")(?=[^>]*method="get")/);
+    expect(html).toMatch(/<select[^>]*name="action"/);
+    // 「全部」之外，选项是登记过的动作（值是动作键，显示中文 label）
+    expect(html).toMatch(/<option value=""[^>]*>全部<\/option>/);
+    expect(html).toMatch(/<option value="member\.invited"[^>]*>邀请成员<\/option>/);
+    expect(html).toMatch(/<option value="api_key\.created"[^>]*>创建 API Key<\/option>/);
+    // 默认选「全部」
+    expect(html).toMatch(/<option value=""[^>]*\bselected\b[^>]*>全部<\/option>/);
+
+    // 筛选后下拉框仍选中该动作；非法值回显为「全部」
+    const picked = await (await admin.get('/audit?action=member.invited')).text();
+    expect(picked).toMatch(/<option value="member\.invited"[^>]*\bselected\b[^>]*>邀请成员<\/option>/);
+    const bogus = await (await admin.get('/audit?action=bogus')).text();
+    expect(bogus).toMatch(/<option value=""[^>]*\bselected\b[^>]*>全部<\/option>/);
+  });
 });
 
 describe('跨租户访问一律拒绝', () => {

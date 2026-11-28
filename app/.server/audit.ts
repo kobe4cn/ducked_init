@@ -1,5 +1,5 @@
 // app/.server/audit.ts —— 审计日志：记录关键操作。租户管理员按租户查看；运营者的操作与平台级事件在运营后台查看
-import { desc, eq } from 'drizzle-orm';
+import { and, desc, eq, like, type SQL } from 'drizzle-orm';
 import type { CurrentMember } from './auth';
 import { CATALOG_ACTIONS, currentCatalogTx } from './catalog/tx';
 import { getDb, type Db } from './db/client';
@@ -9,6 +9,7 @@ import { TEMPLATES } from './pipeline/templates';
 import { describeQuotaChange, type TenantQuota } from './quota';
 import type { BrokenMapping } from './schema-alerts';
 import type { NewFallback } from './fallback-alerts';
+import { cmpName } from '../lib/compare';
 import { entityLabel } from '../lib/canonical-model';
 import { claimTypeLabel } from '../lib/semantic-claims';
 
@@ -497,12 +498,35 @@ function present(r: AuditRow) {
   };
 }
 
-/** 本租户最近的审计记录（按时间倒序），已转成可展示的文字。平台级事件的租户为空，不会出现在这里 */
-export async function listAuditLogs(tenantId: string) {
+/** 筛选下拉的选项：登记过的动作，中文 label 按拼音排序；「全部」由页面自己加 */
+export function auditActionOptions() {
+  return Object.entries(ACTIONS)
+    .map(([value, a]) => ({ value, label: a.label }))
+    .sort((x, y) => cmpName(x.label, y.label));
+}
+
+/** 把 ?action= 规范化：是登记过的动作键、或以 . 结尾且确实是某些键的前缀时原样返回，其余（含空）返回 null（＝全部） */
+export function normalizeAuditAction(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const keys = Object.keys(ACTIONS);
+  return keys.includes(value) || (value.endsWith('.') && keys.some(k => k.startsWith(value))) ? value : null;
+}
+
+/** 本租户最近的审计记录（按时间倒序），已转成可展示的文字。平台级事件的租户为空，不会出现在这里。
+ *  action 只接受 normalizeAuditAction 认识的值（精确动作或以 . 结尾的前缀），其余忽略；租户条件始终保留 */
+export async function listAuditLogs(tenantId: string, action?: string) {
+  const filter = normalizeAuditAction(action);
+  let actionCond: SQL | undefined;
+  if (filter?.endsWith('.')) {
+    // 前缀匹配先转义 % 与 _（_ 是 LIKE 的单字符通配符）：api_ 只匹配字面的 api_*，不把 _ 当通配符
+    actionCond = like(auditLogs.action, `${filter.replace(/[%_]/g, m => `\\${m}`)}%`);
+  } else if (filter != null) {
+    actionCond = eq(auditLogs.action, filter);
+  }
   const rows = await getDb()
     .select()
     .from(auditLogs)
-    .where(eq(auditLogs.tenantId, tenantId))
+    .where(actionCond ? and(eq(auditLogs.tenantId, tenantId), actionCond) : eq(auditLogs.tenantId, tenantId))
     .orderBy(desc(auditLogs.createdAt), desc(auditLogs.id))
     .limit(AUDIT_PAGE_SIZE);
   return rows.map(present);
