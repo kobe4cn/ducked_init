@@ -1,14 +1,14 @@
 // app/routes/knowledge.sources.$id.tsx —— 知识来源原文页（ADR-0046 入口③，#527）：有 definitions:read 就能看（原文是成员写的元数据说明，不是业务数据）。
 // 正文按保存时的段落逐段显示，每段带 p<段号> 锚点与段号，知识面板里 source:<id>#p<段号> 的证据链接就跳到这里（?v= 是证据记下的版本）。
 // 每次保存的正文都留存（#966）：URL 带 ?v=N 时显示第 N 版的正文与段落，页头标「第 N 版（当前第 M 版）」；
-// 版本不存在时显示当前版并提示段号可能对不上，不带 ?v= 时就是当前版。非 UUID、不存在、属于别的租户都是 400
+// 版本不存在时显示当前版并提示段号可能对不上，不带 ?v= 时就是当前版。非 UUID、不存在、属于别的租户都是 404（#1335，和其他资源页一致）
 import { AlertTriangle } from 'lucide-react';
 import { data, Link } from 'react-router';
 import type { Route } from './+types/knowledge.sources.$id';
 import { requirePermission } from '~/.server/access';
 import { errorTextFor } from '~/.server/i18n';
 import { KnowledgeError } from '~/.server/knowledge/basis';
-import { getKnowledgeSource } from '~/.server/knowledge/sources';
+import { getKnowledgeSource, KnowledgeSourceNotFound } from '~/.server/knowledge/sources';
 import { navFor } from '~/.server/nav';
 import { AppShell } from '~/components/app-shell';
 import { Alert, AlertTitle } from '~/components/ui/alert';
@@ -49,6 +49,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       evidenceVersion,
     };
   } catch (e) {
+    // 来源本身找不到（非 UUID、不存在、别的租户）是 404「页面不存在」，和其他资源页一致（#1335）；要在 KnowledgeError 分支之前接住
+    if (e instanceof KnowledgeSourceNotFound) throw data(null, { status: 404 });
     if (e instanceof KnowledgeError) throw data({ message: await errorTextFor(request, e) }, { status: e.status });
     throw e;
   }

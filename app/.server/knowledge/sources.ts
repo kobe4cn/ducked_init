@@ -114,8 +114,11 @@ export async function saveKnowledgeSource(
   }
 }
 
+/** 来源不存在（不是 UUID、查不到或属于别的租户）：状态仍是 400，页面 loader 单独接住转 404，导入（importFromSource）仍按 400 处理（#1335） */
+export class KnowledgeSourceNotFound extends KnowledgeError {}
+
 /**
- * 读一个来源，有 definitions:read 就能看（原文是成员写的元数据说明，不是业务数据）；不是 UUID、不存在或属于别的租户时 400。
+ * 读一个来源，有 definitions:read 就能看（原文是成员写的元数据说明，不是业务数据）；不是 UUID、不存在或属于别的租户时抛 KnowledgeSourceNotFound（页面转 404，导入仍 400）。
  * 带 version 且不是当前版时读那一版的历史正文（#966）：version 是实际显示的版本、updatedAt 是那一版的保存时刻；
  * 版本不存在不是错误——回退当前版（version = currentVersion = 行上的 version），页面上再提示段号可能对不上
  */
@@ -125,7 +128,7 @@ export async function getKnowledgeSource(member: CurrentMember, id: unknown, ver
     ? await getDb().select().from(knowledgeSources)
       .where(and(eq(knowledgeSources.id, id), eq(knowledgeSources.tenantId, member.tenant.id)))
     : [];
-  if (!row) throw new KnowledgeError('没有这个来源');
+  if (!row) throw new KnowledgeSourceNotFound('没有这个来源');
   if (version !== undefined && version !== row.version) {
     const [past] = await getDb().select().from(knowledgeSourceVersions)
       .where(and(
