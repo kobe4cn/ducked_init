@@ -130,6 +130,28 @@ describe('我的设置：个人令牌', () => {
     expect(page).toContain('run_query');
   });
 
+  it('角色执行不了查询时签不了允许查询的令牌：勾选框禁用、说明换成「角色不能执行查询」，表单带 allowQuery 也按不允许存；降级前签的令牌列表标「当前角色不可用」', async () => {
+    const acme = await newTenant('acme');
+    const demoted = await memberOf(acme, 'an@acme.com', 'analyst');
+    const admin = await memberOf(acme, 'admin@acme.com', 'admin');
+    const browser = await loginAs(app, 'an@acme.com');
+    await issue(browser, '降级前签的', { days: '30', allowQuery: 'on' });
+
+    await changeMemberRole(admin, demoted.memberId, 'viewer');
+    const page = await (await browser.get('/settings')).text();
+    const checkbox = page.match(/<input[^>]*id="token-allow-query"[^>]*>/)?.[0];
+    expect(checkbox).toContain('disabled');
+    expect(page).toContain('你当前的角色不能执行查询，令牌拿不到 run_query');
+    expect(page).toContain('可执行查询（当前角色不可用）');
+    // 徽标里的文案是整句「当前角色不可用」，不能只剩旧的「可执行查询」
+    expect(page).not.toContain('>可执行查询<');
+
+    await issue(browser, '降级后签的', { days: '30', allowQuery: 'on' });
+    const rows = await getDb().select().from(memberTokens);
+    expect(rows.find(r => r.name === '降级后签的')?.allowQuery).toBe(false);
+    expect(rows.find(r => r.name === '降级前签的')?.allowQuery).toBe(true);
+  });
+
   it('另一位成员看不到、也吊销不了别人的令牌（404），令牌照常可用', async () => {
     const acme = await newTenant('acme');
     await memberOf(acme, 'an@acme.com', 'analyst');
