@@ -13,7 +13,8 @@ import type { Catalog, CatalogEntry } from './index';
 import { tenantCatalog } from './load';
 import { rankedSearch, visibilityClass, visibleCatalog } from './projection';
 
-/** 歧义提示（#827）：判为歧义的词与候选，只放标识与名称（不放口径取值），候选链到业务知识页 */
+/** 歧义提示（#827）：判为歧义的词与候选，只放标识与名称（不放口径取值），候选链到业务知识页；
+ *  同组重名的候选带区分（#1319）：字段条目写「实体名称 · 字段名称」，其他种类在名称后加「（标识）」 */
 export type DraftAmbiguity = { groups: { term: string; candidates: { id: string; name: string }[] }[] };
 
 /**
@@ -32,10 +33,24 @@ export async function draftSearch(actor: CurrentMember, query: string, limit: nu
   const defaulted = new Set(defaults.map(d => d.entryId));
   const entries = [...hits.filter(r => defaulted.has(r.entry.id)), ...hits.filter(r => !defaulted.has(r.entry.id))].map(r => r.entry);
   const names = new Map(catalog.entries.map(e => [e.id, e.name]));
+  // 同组重名的候选带区分信息（#1319）：字段条目写成「实体名称 · 字段名称」（FieldEntry.entity 就是实体条目的标识 entity:<实体>，
+  // 实体名称取目录里同名条目，找不到时用去掉前缀的实体标识），其他种类在名称后加「（标识）」；不重名的候选保持条目自己的名称
+  const candidatesOf = (ids: string[]) => {
+    const counts = new Map<string, number>();
+    for (const name of ids.map(id => names.get(id) ?? id)) counts.set(name, (counts.get(name) ?? 0) + 1);
+    return ids.map(id => {
+      const name = names.get(id) ?? id;
+      if ((counts.get(name) ?? 0) < 2) return { id, name };
+      const entry = catalog.entries.find(e => e.id === id);
+      return { id, name: entry?.kind === 'field'
+        ? `${names.get(entry.entity) ?? entry.entity.replace(/^entity:/, '')} · ${name}`
+        : `${name}（${id}）` };
+    });
+  };
   return {
     catalog, entries,
     ambiguity: ambiguous && !fallback
-      ? { groups: groups.map(g => ({ term: g.term, candidates: g.candidates.map(id => ({ id, name: names.get(id) ?? id })) })) }
+      ? { groups: groups.map(g => ({ term: g.term, candidates: candidatesOf(g.candidates) })) }
       : null,
   };
 }
