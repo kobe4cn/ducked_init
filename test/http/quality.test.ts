@@ -201,6 +201,9 @@ describe('数据质量页', () => {
       { name: 'points_balance', level: 'warn', entity: 'membership', failed: 1 },
       { name: 'amount_non_negative', level: 'error', entity: 'order', failed: 2 },
     ]);
+    // 另一个读会员的定义更早完成、报了同一条断言：同一条断言被多个任务报到时只算一次（按 level、name、entity 去重）
+    const d3 = randomUUID();
+    await gold('gold.dsl', d3, at(-1), [{ name: 'points_balance', level: 'warn', entity: 'membership', failed: 1 }]);
     await gold('gold.dsl', randomUUID(), at(1), [{ name: 'points_balance', level: 'warn', entity: 'membership', failed: 0 }]);
     // 模板任务没有 definitionId，任务键只按 kind：更早一次的阻断失败被后来通过的运行顶掉，不再计入
     await gold('gold.rfm', null, at(2), [{ name: 'amount_non_negative', level: 'error', entity: 'order', failed: 1 }]);
@@ -216,18 +219,19 @@ describe('数据质量页', () => {
     const html = await (await browser.get('/quality')).text();
     expect(html).toMatch(/最近一次告警<\/div><div class="[^"]*">1<\/div>/);
     expect(html).toMatch(/最近一次阻断失败<\/div><div class="[^"]*">1<\/div>/);
-    expect(html).toMatch(/覆盖 (<!-- -->)?3(<!-- -->)? 个结果层任务/);
+    expect(html).toMatch(/覆盖 (<!-- -->)?4(<!-- -->)? 个结果层任务/);
     expect(html).toContain(`href="/quality?task=${first.id}"`);
 
-    // first 的定义重跑并通过：只看每个任务键的最近一次，它上一次的失败不再计入，提示不再带失败任务的链接
+    // first 与 d3 的定义重跑并通过：只看每个任务键的最近一次，它上一次的失败不再计入，提示不再带失败任务的链接
     await gold('gold.dsl', d1, at(5), [
       { name: 'points_balance', level: 'warn', entity: 'membership', failed: 0 },
       { name: 'amount_non_negative', level: 'error', entity: 'order', failed: 0 },
     ]);
+    await gold('gold.dsl', d3, at(6), [{ name: 'points_balance', level: 'warn', entity: 'membership', failed: 0 }]);
     const rerun = await (await browser.get('/quality')).text();
     expect(rerun).toMatch(/最近一次告警<\/div><div class="[^"]*">0<\/div>/);
     expect(rerun).toMatch(/最近一次阻断失败<\/div><div class="[^"]*">0<\/div>/);
-    expect(rerun).toMatch(/覆盖 (<!-- -->)?3(<!-- -->)? 个结果层任务/);
+    expect(rerun).toMatch(/覆盖 (<!-- -->)?4(<!-- -->)? 个结果层任务/);
     expect(rerun).not.toContain('href="/quality?task=');
   });
 

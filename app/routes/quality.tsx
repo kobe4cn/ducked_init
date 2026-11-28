@@ -12,7 +12,7 @@ import { excludeValue, ExclusionError, includeValue, listExcludedValues } from '
 import { latestIdentitySummary } from '~/.server/merges';
 import { navFor } from '~/.server/nav';
 import { HOT_VALUE_THRESHOLD } from '~/.server/pipeline/identity-engine';
-import { ASSERTION_LABELS, describeCustom, SAMPLE_LIMIT, type AssertionLevel } from '~/.server/pipeline/assertions';
+import { ASSERTION_LABELS, describeCustom, SAMPLE_LIMIT, type AssertionLevel, type AssertionResult } from '~/.server/pipeline/assertions';
 import { latestResultCheck, mappingLabels, QUALITY_QUARANTINE, QUALITY_RUNS, readQuality } from '~/.server/quality';
 import { listSources } from '~/.server/sources';
 import { UUID } from '~/.server/tenants';
@@ -66,8 +66,8 @@ export async function loader({ request }: Route.LoaderArgs) {
       tasks: check?.tasks ?? 0,
       /** 有失败断言的任务里最近完成的一个：提示链到它的 ?task= 筛选 */
       failedTaskId: check?.failedTaskId,
-      errors: latest.filter(a => a.level === 'error' && a.failed > 0).length,
-      warns: latest.filter(a => a.level === 'warn' && a.failed > 0).length,
+      errors: failedChecks(latest, 'error'),
+      warns: failedChecks(latest, 'warn'),
     },
   };
 }
@@ -96,6 +96,13 @@ export async function action({ request }: Route.ActionArgs) {
     throw e;
   }
 }
+
+/**
+ * 某级别不合格的断言条数。内置断言按任务读到的实体跑，同一次刷新里读同一实体的多个任务会各报一遍同一条断言，
+ * 所以按 (level, name, entity) 去重：一条断言在任一任务的最近一次运行里失败就算 1，不随扇出的任务数放大（#1329）
+ */
+const failedChecks = (assertions: AssertionResult[], level: AssertionLevel) =>
+  new Set(assertions.filter(a => a.level === level && a.failed > 0).map(a => `${a.level}\u0000${a.name}\u0000${a.entity}`)).size;
 
 /** 内置断言的中文名，加上运行记录里映射自定义断言（custom:<字段>:<检查>）现转的中文名 */
 const labelsFor = (names: string[]): Record<string, string> => ({
