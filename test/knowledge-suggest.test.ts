@@ -2,8 +2,9 @@
 // 数据源与源表不进、字段血缘已清）取主题条目与邻接条目，只带已确认的别名 / 口径声明 / 业务说明（需复核的与 system.claims 不进），
 // 数组按 id 排序后算 inputHash；条目上的待处理与已拒绝提案进输入（#953）：pending 带 kind 与内容、rejected 带拒绝理由
 // （每条目最多最近 20 条）、按 kind + stableJson 排序、为空不挂字段；suggestMessages 的 user 消息只放去掉 inputHash 的 JSON，
-// 输入里藏的指令文字只是数据、不在 system 里；SUGGEST_SCHEMA 的 kind 与口径类型是枚举、按 kind 要求对应字段（缺了不合 Schema，#956），
-// system 写明正文放哪、reason 只写理由（版本 suggest-v3）；outputToProposals 返回 { inputs, dropped }：丢证据 ref 不在输入里、
+// 输入里藏的指令文字只是数据、不在 system 里；SUGGEST_SCHEMA 的 kind 与口径类型是枚举、三个内容键都必填且允许 null（schemaForModel 剥掉
+// if/then 后模型侧的 required 仍含 alias / note / claim，#1314；与 kind 对应的字段由 outputToProposals 检查，缺内容只丢那一条），
+// system 写明正文放哪、三个键每条都要给、reason 只写理由（版本 suggest-v4）；outputToProposals 返回 { inputs, dropped }：丢证据 ref 不在输入里、
 // 目标不在对应集合里的提案（dropped 记目标与原因，六种），无证据的口径声明变 unknown，主题归属的 subjectId 来自 input，
 // 别名 / 说明空白或超上限的丢弃；
 // dropPending 落库前兜底（#953）：待处理 note / 同类型 claim / 同别名（含已拒绝的，去空白不分大小写）跳过、subject 仍走指纹（纯函数，不碰库）
@@ -13,6 +14,7 @@ import type {
   CatalogEntry, DefinitionDependencies, EntityEntry, FieldEntry, MetricEntry, RelationEntry, SourceEntry, TableEntry, TagEntry,
 } from '../app/.server/catalog';
 import type { Claim, Knowledge } from '../app/.server/knowledge/catalog';
+import { schemaForModel } from '../app/.server/llm';
 import {
   dropPending, outputToProposals, subjectInput, suggestMessages, SUGGEST_GENERATOR_VERSION, SUGGEST_SCHEMA,
   type ProposalBrief, type SuggestOutput,
@@ -200,7 +202,7 @@ describe('suggestMessages', () => {
 
   it('system 写明 pending / rejected 是什么，已有同类待处理的、被拒绝过的不要再提；写明正文放哪个字段、reason 只写理由', () => {
     const [system] = suggestMessages(subjectInput({ entries: [] }, subject));
-    expect(SUGGEST_GENERATOR_VERSION).toBe('suggest-v3'); // 提示词与 Schema 变了，升版后已有代次不再命中
+    expect(SUGGEST_GENERATOR_VERSION).toBe('suggest-v4'); // 提示词与 Schema 变了，升版后已有代次不再命中
     expect(system.content).toContain('pending 是该条目待处理的提案');
     expect(system.content).toContain('rejected 是该条目被拒绝的提案及拒绝理由');
     expect(system.content).toContain('已有同种类待处理提案的不要再提');
@@ -221,21 +223,34 @@ describe('SUGGEST_SCHEMA', () => {
     for (const t of Object.values(CLAIM_TYPES)) for (const v of t.values) expect(values).toContain(v.value);
   });
 
-  it('按 kind 要求对应字段：note 缺 note、alias 缺 alias、claim 缺 claim 都不通过，subject 只带公共字段通过；报错是「缺哪个键」的 required', () => {
+  it('三个内容键都必填且允许 null：模型侧 Schema 的 required 含 alias / note / claim、都在 reason 前；null 过得了 Schema，缺内容由 outputToProposals 逐条丢', () => {
+    // 发给模型的 Schema（schemaForModel 剥掉条件关键字后）：三个内容键都进 required，模型省不掉（#1313 同因：if/then 模型侧看不见）
+    const modelItems = (schemaForModel(SUGGEST_SCHEMA) as {
+      properties: { proposals: { items: { required: string[]; properties: Record<string, unknown> } } };
+    }).properties.proposals.items;
+    expect(modelItems.required).toEqual(['kind', 'targetId', 'alias', 'note', 'claim', 'evidence', 'reason']);
+    const keys = Object.keys(modelItems.properties);
+    for (const key of ['alias', 'note', 'claim']) expect(keys.indexOf(key)).toBeLessThan(keys.indexOf('reason'));
+    // 本地 Ajv 与模型共用这份 Schema（llm.ts 同一配置）：三个键全为 null 也通过，缺内容不再整次 422
     const validate = new Ajv({ allErrors: true, strict: false }).compile(SUGGEST_SCHEMA);
     const base = { targetId: 'metric:paid_revenue', evidence: [{ ref: 'entity:order' }], reason: '常用叫法' };
-    // 缺对应字段（llm.ts 用同一个 Ajv 配置校验，这里预演整次调用 422 的条件）
-    expect(validate({ proposals: [{ ...base, kind: 'note' }] })).toBe(false);
-    expect(validate.errors?.some(e => e.keyword === 'required' && e.params.missingProperty === 'note')).toBe(true);
-    expect(validate({ proposals: [{ ...base, kind: 'alias' }] })).toBe(false);
-    expect(validate({ proposals: [{ ...base, kind: 'claim' }] })).toBe(false);
-    // 带上对应字段就通过；subject 不加要求（只靠 targetId 指邻接条目，subjectId 由代码填）
+    expect(validate({ proposals: [{ ...base, kind: 'note', alias: null, note: null, claim: null }] })).toBe(true);
     expect(validate({ proposals: [
-      { ...base, kind: 'note', note: '只算实付金额' },
-      { ...base, kind: 'alias', alias: '成交额' },
-      { ...base, kind: 'claim', claim: { type: 'currency', value: 'CNY' } },
-      { kind: 'subject', targetId: 'entity:customer', evidence: [{ ref: 'field:customer.id' }], reason: '在主题里' },
+      { ...base, kind: 'note', alias: null, note: '只算实付金额', claim: null },
+      { ...base, kind: 'alias', alias: '成交额', note: null, claim: null },
+      { ...base, kind: 'claim', alias: null, note: null, claim: { type: 'currency', value: 'CNY' } },
+      { kind: 'subject', targetId: 'entity:customer', alias: null, note: null, claim: null, evidence: [{ ref: 'field:customer.id' }], reason: '在主题里' },
     ] })).toBe(true);
+    // 按 kind 检查对应字段挪到了 outputToProposals：note 为 null 的那条丢掉、记 note_invalid；subject 三个键 null 照常通过
+    const { inputs, dropped } = outputToProposals({ proposals: [
+      { ...base, kind: 'note', alias: null, note: null, claim: null },
+      { kind: 'subject', targetId: 'entity:customer', alias: null, note: null, claim: null, evidence: [{ ref: 'field:customer.id' }], reason: '在主题里' },
+    ] }, subjectInput({ entries: SUBJECT_CATALOG }, subject));
+    expect(dropped).toEqual([{ targetId: 'metric:paid_revenue', reason: 'note_invalid' }]);
+    expect(inputs).toEqual([{
+      targetId: 'entity:customer', mappingId: null, kind: 'subject', content: { subjectId: SUBJECT_ID },
+      evidence: [{ ref: 'field:customer.id' }], generatorVersion: SUGGEST_GENERATOR_VERSION,
+    }]);
   });
 });
 
