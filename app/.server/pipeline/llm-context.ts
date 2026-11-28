@@ -1,7 +1,9 @@
 // app/.server/pipeline/llm-context.ts —— 发给模型服务的表上下文（ADR-0035，纯函数）：默认只有表结构与采集时的列统计；
 // 租户打开「发送脱敏样本」时调用方另外传入原始层的几行样本（敏感列已是 ADR-0022 预览用的加盐哈希）。
-// 列统计里敏感列本来就不存 top、文本列不存 min / max（ADR-0016），这里原样带过去。
+// 列统计里敏感列本来就不存 top、文本列不存 min / max（ADR-0016），这里原样带过去；
+// 敏感列名的 min / max 在这里再剔一次，兜住旧的采集结果（#1317）。
 // 逐个字段抄写是有意的：ColumnContext 是发给模型的字段白名单，ColumnProfile 以后加字段不会自动发出去
+import { SENSITIVE_NAME } from '../../lib/sensitive';
 import type { ColumnProfile, TableProfile } from './source-engine';
 
 export interface ColumnContext {
@@ -39,8 +41,8 @@ export function buildTableContext(profile: TableProfile, samples?: Record<string
       type: c.type,
       nullRate: c.nullRate,
       distinct: c.distinct,
-      min: c.min,
-      max: c.max,
+      min: SENSITIVE_NAME.test(c.name) ? null : c.min,
+      max: SENSITIVE_NAME.test(c.name) ? null : c.max,
       length: c.length ?? null,
       formats: c.formats ?? null,
       top: c.top ?? null,

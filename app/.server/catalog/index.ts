@@ -16,7 +16,7 @@ import { noteKey } from '../../lib/business-note-key';
 import { cmp, deriveLineage } from '../../lib/lineage';
 import { entityFields } from '../../lib/lineage-fields';
 import { ruleText } from '../../lib/merge-groups';
-import { looksSensitive } from '../../lib/sensitive';
+import { looksSensitive, SENSITIVE_NAME } from '../../lib/sensitive';
 import type { RegisteredEntity } from '../custom-entities';
 import type { PublishedMergeGroup } from '../merge-groups';
 import { DSL_KINDS, type DslKind } from '../pipeline/dsl';
@@ -258,7 +258,8 @@ const isTimeType = (type: string) => /^(DATE|TIMESTAMP)/i.test(type);
 
 const toColumnStats = (c: NonNullable<CatalogInput['tableStats']>[number]['columns'][number]): ColumnStats => ({
   name: c.name, nullRate: c.nullRate,
-  ...(isTimeType(c.type) && c.min !== null && c.max !== null && { range: { min: c.min, max: c.max } }),
+  // 像生日的日期列也不给时间范围（#1317）；上游 visibleColumns 已滤掉敏感列，这里再拦一次兜住旧的采集结果
+  ...(isTimeType(c.type) && !SENSITIVE_NAME.test(c.name) && c.min !== null && c.max !== null && { range: { min: c.min, max: c.max } }),
   ...(c.top?.length && { top: c.top.map(t => ({ value: t.value, rows: t.rows })) }),
 });
 

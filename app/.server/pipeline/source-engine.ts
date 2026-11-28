@@ -627,8 +627,8 @@ async function profileTable(
         type: c.column_type,
         nullRate,
         distinct: Math.min(Number(c.approx_unique), Math.round(count * (1 - nullRate))),
-        min: isNumeric(c.column_type) || isTemporal(c.column_type) ? c.min : null,
-        max: isNumeric(c.column_type) || isTemporal(c.column_type) ? c.max : null,
+        min: (isNumeric(c.column_type) || isTemporal(c.column_type)) && !SENSITIVE_NAME.test(c.column_name) ? c.min : null,
+        max: (isNumeric(c.column_type) || isTemporal(c.column_type)) && !SENSITIVE_NAME.test(c.column_name) ? c.max : null,
       };
       const i = texts.indexOf(c);
       if (i >= 0 && textStats[`min${i}`] !== null) {
