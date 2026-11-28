@@ -868,6 +868,33 @@ describe('transient 错误重试 1 次（#1215）', () => {
     expect(failed[0]).toMatchObject({ errorKind: null });
   });
 
+  it('连不上（拒绝连接）按 cause.code 报中文原因，仍 transient 重试', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    const { received } = fakeLlm(setLlmFetch, () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }); });
+
+    const err = await failure(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)) as LlmError;
+    expect(err).toBeInstanceOf(LlmError);
+    expect(err.message).toContain('拒绝连接');
+    expect(err.message).toContain('ECONNREFUSED');
+    expect(err.transient).toBe(true);
+    expect(received).toHaveLength(2);
+  });
+
+  it('建连超时按 cause.code 报中文原因，不算 error_kind=timeout', async () => {
+    const acme = await newTenant('acme');
+    platformDefault(BASE_WITH_SLASH);
+    fakeLlm(setLlmFetch, () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } }); });
+
+    const err = await failure(chatJson(acme, 'mapping_draft', MESSAGES, SCHEMA)) as LlmError;
+    expect(err).toBeInstanceOf(LlmError);
+    expect(err.message).toContain('连接模型服务端点超时');
+    expect(err.message).toContain('UND_ERR_CONNECT_TIMEOUT');
+    expect(err.timeout).toBe(false);
+    expect(err.kind).not.toBe('timeout');
+    expect(err.transient).toBe(true);
+  });
+
   it('超时不重试：只发 1 次请求、不等待，错误带 timeout', async () => {
     const acme = await newTenant('acme');
     platformDefault(BASE_WITH_SLASH);

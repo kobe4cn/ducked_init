@@ -338,9 +338,19 @@ export interface CallStats {
 
 const maskKey = (apiKey: string, s: string) => (apiKey ? s.replaceAll(apiKey, '***') : s);
 
+/** Node 的 fetch 连不上时只给「fetch failed」，真正原因在 error.cause.code（#1320）：按代码给出可读的中文原因 */
+function networkReason(e: unknown): string | null {
+  const code = (e as { cause?: { code?: unknown } })?.cause?.code;
+  if (typeof code !== 'string') return null;
+  if (code === 'ECONNREFUSED') return zh(msg('连不上模型服务端点（拒绝连接，{code}）', { code }));
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return zh(msg('找不到模型服务端点的主机（{code}）', { code }));
+  if (code === 'UND_ERR_CONNECT_TIMEOUT') return zh(msg('连接模型服务端点超时（{code}）', { code }));
+  return zh(msg('调用模型服务失败：{message}（{code}）', { message: e instanceof Error ? e.message : String(e), code }));
+}
+
 /** 跑 run，失败都转成 LlmError，消息里的 API Key 换成 ***；timeout 只是超时消息里的秒数，中断本身由 postJson 的 AbortSignal 负责。
  *  signal 是调用方的外部 signal（#1248）：中止时 fetch 以 AbortError 拒绝，名字与外部中止分不开，只看 signal.aborted——
- *  此时不算超时、不标 transient（logged 不重试） */
+ *  此时不算超时、不标 transient（logged 不重试）。网络错误（连不上、主机不存在、建连超时）按 cause.code 报中文原因（#1320） */
 async function masked<T>(apiKey: string, run: () => Promise<T>, timeout = timeoutMs(), signal?: AbortSignal): Promise<T> {
   try {
     return await run();
@@ -351,7 +361,7 @@ async function masked<T>(apiKey: string, run: () => Promise<T>, timeout = timeou
     // 超时（含查询向量的短超时）标上 kind，logged 写进 llm_calls.error_kind（#1253）
     throw new LlmError(maskKey(apiKey, e instanceof LlmError ? e.message
       : timedOut ? `模型服务 ${timeout / 1000} 秒内没有返回`
-      : `调用模型服务失败：${e instanceof Error ? e.message : String(e)}`), e instanceof LlmError ? e.transient : true,
+      : networkReason(e) ?? `调用模型服务失败：${e instanceof Error ? e.message : String(e)}`), e instanceof LlmError ? e.transient : true,
       e instanceof LlmError ? e.status : undefined, wasTimeout, false, wasTimeout ? 'timeout' : undefined,
       e instanceof LlmError ? e.truncated : false);
   }
