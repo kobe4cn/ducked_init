@@ -522,9 +522,9 @@ describe('模型服务页', () => {
 
     const page = await (await admin.get('/model-provider')).text();
     expect(page).toContain('data-tier-purposes-reasoning="assistant,mapping_draft,metric_draft,tag_draft,workbench_draft,assertion_draft"');
-    expect(page).toContain('data-tier-purposes-fast="workbench_interpret,knowledge_proposal,knowledge_import,metric_parse"');
+    expect(page).toContain('data-tier-purposes-fast="workbench_interpret,knowledge_proposal,knowledge_import"');
     expect(page).toContain('管：AI 助手、起草映射、起草指标、起草标签、工作台起草、断言草稿');
-    expect(page).toContain('管：工作台结果解读、知识提案、知识导入、一句话解析');
+    expect(page).toContain('管：工作台结果解读、知识提案、知识导入');
     expect(page).not.toContain('这类要快的用途');
 
     // fast 档的第一个用途被挪走后，ping 走该档剩下的第一个用途（照旧用 assertion_draft 会解析到 reasoning 档、显示「使用默认」）

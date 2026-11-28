@@ -27,7 +27,7 @@ import { msg, type Msg } from '~/lib/i18n';
 
 /** 调用的用途，记进调用日志 */
 export type LlmPurpose = 'connectivity' | 'tool_probe' | 'assistant' | 'mapping_draft' | 'metric_draft' | 'tag_draft' | 'assertion_draft'
-  | 'workbench_draft' | 'workbench_interpret' | 'knowledge_proposal' | 'knowledge_import' | 'metric_parse' | 'embedding';
+  | 'workbench_draft' | 'workbench_interpret' | 'knowledge_proposal' | 'knowledge_import' | 'embedding';
 
 /** 档位（ADR-0055）：只有 fast 与 reasoning 两档 */
 export type LlmTier = 'fast' | 'reasoning';
@@ -38,7 +38,7 @@ export type TieredPurpose = Exclude<LlmPurpose, 'connectivity' | 'tool_probe' | 
 /** 分档用途的默认档位：键必须覆盖全部 TieredPurpose，tiersByPurpose 按它的键序列出 */
 const TIERED_PURPOSE_TIER: Record<TieredPurpose, LlmTier> = {
   assistant: 'reasoning', mapping_draft: 'reasoning', metric_draft: 'reasoning', tag_draft: 'reasoning', workbench_draft: 'reasoning',
-  assertion_draft: 'fast', workbench_interpret: 'fast', knowledge_proposal: 'fast', knowledge_import: 'fast', metric_parse: 'fast',
+  assertion_draft: 'fast', workbench_interpret: 'fast', knowledge_proposal: 'fast', knowledge_import: 'fast',
 };
 
 /** 每个用途默认属于哪一档（ADR-0055）：默认写死在这里、不进库，平台可用 LLM_PURPOSE_TIER_OVERRIDES 覆盖（purposeTierOverrides）。
@@ -49,7 +49,7 @@ export const PURPOSE_TIER: Record<LlmPurpose, LlmTier | null> = {
 };
 
 /**
- * 平台级用途分档覆盖（ADR-0055 修订）：每次调用读 LLM_PURPOSE_TIER_OVERRIDES（JSON，如 {"metric_parse":"reasoning"}），
+ * 平台级用途分档覆盖（ADR-0055 修订）：每次调用读 LLM_PURPOSE_TIER_OVERRIDES（JSON，如 {"assertion_draft":"reasoning"}），
  * 不做模块级缓存（改环境变量或 vi.stubEnv 立即生效）。没填或空串按没覆盖处理、不告警；JSON 不合法或不是普通对象（数组、标量）
  * 整体 console.warn 后忽略；逐项检查——键必须是 PURPOSE_TIER 里分了档的用途（connectivity / tool_probe / embedding 不分档，
  * 不可覆盖）、值必须是 fast / reasoning，未知用途、值为 null 或别的档位都算非法项：逐项 console.warn 后跳过，其余合法项照常生效。

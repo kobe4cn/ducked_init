@@ -232,7 +232,6 @@
   "『{term}』指的是哪一个？": "Which one does “{term}” refer to?",
   "『{term}』默认指这一条": "“{term}” defaults to this entry",
   "一个映射把数据源里的一张表（须在同步范围内、已采集）对应到一个实体。字段表达式只能用白名单函数，值字典把源端枚举对应到标准枚举，dedupe 声明去重键与取最新字段。实体与字段说明见": "A mapping links a table in a data source (it must be in sync scope and profiled) to an entity. Field expressions may use whitelisted functions only, value dictionaries map source enums to canonical enums, and dedupe declares the dedupe key and latest-field rules. For entities and fields see the ",
-  "一句话解析": "One-line parsing",
   "一致": "Consistent",
   "一致 {pct}%": "Consistent {pct}%",
   "一致（{n, plural, other {# 个文件}}{inlined}）": "Consistent ({n, plural, one {# file} other {# files}}{inlined})",

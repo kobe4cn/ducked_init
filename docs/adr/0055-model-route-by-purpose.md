@@ -1,8 +1,8 @@
 # 按用途分档：fast 与 reasoning 两档，平台档位走环境变量
 
-模型服务客户端（ADR-0035）按「租户整套 > 平台默认（环境变量 `LLM_*`）」选出唯一一套端点，所有用途共用同一个模型。但不同用途要的智力不一样：起草映射、指标、标签要推理，断言草稿、工作台解读、一句话解析只要快。总票 #508 决定按用途路由。决定：
+模型服务客户端（ADR-0035）按「租户整套 > 平台默认（环境变量 `LLM_*`）」选出唯一一套端点，所有用途共用同一个模型。但不同用途要的智力不一样：起草映射、指标、标签要推理，断言草稿、工作台解读只要快。总票 #508 决定按用途路由。决定：
 
-**只有两档，用途对应默认写死在代码里，平台可用环境变量覆盖单个用途（#1277）。** `llm.ts` 的 `PURPOSE_TIER: Record<LlmPurpose, 'fast' | 'reasoning' | null>` 是默认对照表，不进库。reasoning 档：`assistant`、`mapping_draft`、`metric_draft`、`tag_draft`、`workbench_draft`；fast 档：`assertion_draft`、`workbench_interpret`、`knowledge_proposal`、`knowledge_import`、`metric_parse`；`connectivity`（模型服务页的连通测试）、`tool_probe`（ADR-0042 的工具调用探测）、`embedding`（ADR-0049）不分档，永远用解析出的那一套（`tool_probe` 探测档位模型的例外见「助手一轮只解析一次」）。新增用途时在这里补一行，TypeScript 会提醒。平台运维要把某个用途挪到另一档时设 `LLM_PURPOSE_TIER_OVERRIDES`（JSON，如 `{"metric_parse":"reasoning"}`），不用发版：`purposeTier` 每次调用都解析（不缓存），值域只有 `fast` / `reasoning`，未知用途、值不是这两档（含 null）或不分档的三个用途都算非法项，`console.warn` 后跳过，其余合法项照常生效；JSON 不合法或不是普通对象则整个忽略。覆盖对租户自配的档位同样生效（分档表是全局的）。
+**只有两档，用途对应默认写死在代码里，平台可用环境变量覆盖单个用途（#1277）。** `llm.ts` 的 `PURPOSE_TIER: Record<LlmPurpose, 'fast' | 'reasoning' | null>` 是默认对照表，不进库。reasoning 档：`assistant`、`mapping_draft`、`metric_draft`、`tag_draft`、`workbench_draft`；fast 档：`assertion_draft`、`workbench_interpret`、`knowledge_proposal`、`knowledge_import`；`connectivity`（模型服务页的连通测试）、`tool_probe`（ADR-0042 的工具调用探测）、`embedding`（ADR-0049）不分档，永远用解析出的那一套（`tool_probe` 探测档位模型的例外见「助手一轮只解析一次」）。新增用途时在这里补一行，TypeScript 会提醒。平台运维要把某个用途挪到另一档时设 `LLM_PURPOSE_TIER_OVERRIDES`（JSON，如 `{"assertion_draft":"reasoning"}`），不用发版：`purposeTier` 每次调用都解析（不缓存），值域只有 `fast` / `reasoning`，未知用途、值不是这两档（含 null）或不分档的三个用途都算非法项，`console.warn` 后跳过，其余合法项照常生效；JSON 不合法或不是普通对象则整个忽略。覆盖对租户自配的档位同样生效（分档表是全局的）。
 
 **平台档位用环境变量。** `LLM_FAST_MODEL` / `LLM_FAST_BASE_URL` / `LLM_FAST_API_KEY` 与 `LLM_REASONING_*`。只填 `MODEL` 就把该档的模型名换掉，端点与 Key 复用平台默认（`LLM_*`）的；要换端点时 `BASE_URL` 与 `API_KEY` 必须一起填。**只填其中一个按没配置该档位处理**（用默认那一套，`console.warn`）：不能把平台默认的 Key 发到另一个端点。空串算没填。
 
