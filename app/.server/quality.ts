@@ -6,7 +6,7 @@
 import { and, desc, eq, inArray, isNotNull, like, sql } from 'drizzle-orm';
 import { recordAudit } from './audit';
 import { getDb } from './db/client';
-import { auditLogs, mappings, members, sources, tasks } from './db/schema';
+import { auditLogs, dslDefinitions, mappings, members, sources, tasks } from './db/schema';
 import { lakeReady, lakeRow, lakeSpecOf } from './lake';
 import { getMailer } from './mailer';
 import { openTenantLake } from './pipeline/lake-engine';
@@ -73,13 +73,16 @@ export async function alertAssertionFailure(
 
 /** 每个结果层任务键（kind 加 params 里的 definitionId；模板任务没有 definitionId，就只按 kind）各自最近一次跑过断言（gold.*，
  *  结果里有 assertions）的运行。一次刷新会扇出很多 gold.dsl（一个定义一个任务），只看最后完成的一个会漏掉同批其他任务的失败（#1329）。
+ *  已删除的定义不计入：deleteDefinition 是硬删除，删掉的定义不会再跑，它最后一次 gold.dsl 的失败不能一直留在统计里；
+ *  gold.dsl 的 definitionId 要在本租户的 dsl_definitions 里还存在，模板任务（没有 definitionId）照旧只按 kind。
  *  返回覆盖的任务数、有失败断言的任务里最近完成的一个的任务 ID（提示链到 ?task= 用）与合并后的断言结果；还没有时为 undefined */
 export async function latestResultCheck(tenantId: string): Promise<{ tasks: number; failedTaskId?: string; assertions: AssertionResult[] } | undefined> {
   // DISTINCT ON 的键：kind 加 params->>'definitionId'（模板任务的 params 里没有这一项，NULL 之间按相同处理，就只按 kind）；
   // orderBy 必须以 DISTINCT ON 的表达式开头，键内再按 finished_at 倒序：每个任务键各取最近一次完成的
   const rows = await getDb().selectDistinctOn([tasks.kind, sql`${tasks.params} ->> 'definitionId'`], { id: tasks.id, finishedAt: tasks.finishedAt, result: tasks.result })
     .from(tasks)
-    .where(and(eq(tasks.tenantId, tenantId), like(tasks.kind, 'gold.%'), isNotNull(tasks.finishedAt), sql`${tasks.result} -> 'assertions' IS NOT NULL`))
+    .where(and(eq(tasks.tenantId, tenantId), like(tasks.kind, 'gold.%'), isNotNull(tasks.finishedAt), sql`${tasks.result} -> 'assertions' IS NOT NULL`,
+      sql`(${tasks.kind} <> 'gold.dsl' OR EXISTS (SELECT 1 FROM ${dslDefinitions} WHERE ${dslDefinitions.tenantId} = ${tasks.tenantId} AND ${dslDefinitions.id}::text = ${tasks.params} ->> 'definitionId'))`))
     .orderBy(tasks.kind, sql`${tasks.params} ->> 'definitionId'`, desc(tasks.finishedAt));
   if (!rows.length) return undefined;
   // 查询按 gold.% 匹配，模板任务（gold.rfm/…）与 gold.expire 也会进来：只借 gold.dsl 的结果类型读，不带 kind（#477）

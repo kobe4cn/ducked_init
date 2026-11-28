@@ -2,17 +2,16 @@
 // 有 sources:read 的成员在 /quality 看到本租户最近的断言结果（失败标出）与隔离区样本，页面上没有明文；没有该权限的成员 403，其他租户的成员看不到；
 // 最近一次成功打通的 hot（一个值连了太多源记录）在 /quality 列出哈希、记录数与数据源名，customer 映射的合并记录页顶部给出提示；
 // 有 sources:write 的成员把 hot 里的值标为不参与匹配或撤销：登记进平台表、审计只有哈希与记录数，入队带排除列表、强制重算打通的合并
-import { randomUUID } from 'node:crypto';
 import { and, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb } from '../../app/.server/db/client';
-import { auditLogs, identityExcludedValues, mappings, tasks } from '../../app/.server/db/schema';
+import { auditLogs, dslDefinitions, identityExcludedValues, mappings, tasks } from '../../app/.server/db/schema';
 import { lakeRow, lakeSpecOf } from '../../app/.server/lake';
 import { createDispatcher } from '../../app/.server/pipeline/dispatcher';
 import { openTenantLake } from '../../app/.server/pipeline/lake-engine';
 import { publishMapping, saveDraft } from '../../app/.server/mappings';
 import { syncSource } from '../../app/.server/source-sync';
-import { memberOf, newTenant, runTask } from '../pipeline/fixtures';
+import { defaultSpaceOf, memberOf, newTenant, runTask } from '../pipeline/fixtures';
 import { CRM_ORDERS, publishedIdentitySources } from '../pipeline/identity-fixtures';
 import { fakeHot } from '../pipeline/identity-helpers';
 import { grantOnSource } from '../pipeline/source-fixtures';
@@ -195,16 +194,20 @@ describe('数据质量页', () => {
         params: { kind: 'metric', sql: 'SELECT 1', entities: ['order'], ...(definitionId ? { definitionId } : {}) },
         result: { assertions },
       }).returning())[0];
+    // gold.dsl 的任务键要对应本租户还存在的定义（已删除的定义不计入），先建真实定义
+    const space = await defaultSpaceOf(acme);
+    const definition = async (key: string) =>
+      (await getDb().insert(dslDefinitions).values({ tenantId: acme, spaceId: space, kind: 'metric', key }).returning())[0].id;
     // 两个定义的 gold.dsl 先后完成：先完成的带 warn 与阻断失败，后完成的全部通过（旧实现只看最后完成的这个，两个数都显示 0）
-    const d1 = randomUUID();
+    const d1 = await definition('m1');
     const first = await gold('gold.dsl', d1, at(0), [
       { name: 'points_balance', level: 'warn', entity: 'membership', failed: 1 },
       { name: 'amount_non_negative', level: 'error', entity: 'order', failed: 2 },
     ]);
     // 另一个读会员的定义更早完成、报了同一条断言：同一条断言被多个任务报到时只算一次（按 level、name、entity 去重）
-    const d3 = randomUUID();
+    const d3 = await definition('m3');
     await gold('gold.dsl', d3, at(-1), [{ name: 'points_balance', level: 'warn', entity: 'membership', failed: 1 }]);
-    await gold('gold.dsl', randomUUID(), at(1), [{ name: 'points_balance', level: 'warn', entity: 'membership', failed: 0 }]);
+    await gold('gold.dsl', await definition('m2'), at(1), [{ name: 'points_balance', level: 'warn', entity: 'membership', failed: 0 }]);
     // 模板任务没有 definitionId，任务键只按 kind：更早一次的阻断失败被后来通过的运行顶掉，不再计入
     await gold('gold.rfm', null, at(2), [{ name: 'amount_non_negative', level: 'error', entity: 'order', failed: 1 }]);
     await gold('gold.rfm', null, at(3), [{ name: 'amount_non_negative', level: 'error', entity: 'order', failed: 0 }]);
@@ -233,6 +236,28 @@ describe('数据质量页', () => {
     expect(rerun).toMatch(/最近一次阻断失败<\/div><div class="[^"]*">0<\/div>/);
     expect(rerun).toMatch(/覆盖 (<!-- -->)?4(<!-- -->)? 个结果层任务/);
     expect(rerun).not.toContain('href="/quality?task=');
+  });
+
+  it('已删除的定义不计入「最近一次」：定义最后一次 gold.dsl 带 warn 失败，删掉定义后变回 0、提示不再带 ?task= 链接', async () => {
+    const acme = await newTenant('acme');
+    const [def] = await getDb().insert(dslDefinitions)
+      .values({ tenantId: acme, spaceId: await defaultSpaceOf(acme), kind: 'metric', key: 'points_gap' }).returning();
+    const [run] = await getDb().insert(tasks).values({
+      tenantId: acme, kind: 'gold.dsl', status: 'succeeded', finishedAt: new Date(),
+      params: { kind: 'metric', sql: 'SELECT 1', entities: ['membership'], definitionId: def.id },
+      result: { assertions: [{ name: 'points_balance', level: 'warn', entity: 'membership', failed: 1 }] },
+    }).returning();
+    await memberOf(acme, 'analyst@acme.com', 'analyst');
+    const browser = await loginAs(app, 'analyst@acme.com');
+    const html = await (await browser.get('/quality')).text();
+    expect(html).toMatch(/最近一次告警<\/div><div class="[^"]*">1<\/div>/);
+    expect(html).toContain(`href="/quality?task=${run.id}"`);
+
+    // deleteDefinition 是硬删除，删掉的定义不会再跑：它最后一次的失败不再计入
+    await getDb().delete(dslDefinitions).where(eq(dslDefinitions.id, def.id));
+    const after = await (await browser.get('/quality')).text();
+    expect(after).toMatch(/最近一次告警<\/div><div class="[^"]*">0<\/div>/);
+    expect(after).not.toContain('href="/quality?task=');
   });
 
   it('按任务筛选：?task= 只看该任务的断言与隔离区，隔离区行显示来源映射并链到映射详情页；映射删了只显 ID；参数不是 UUID 忽略；别的租户用同一 ID 是空', async () => {
