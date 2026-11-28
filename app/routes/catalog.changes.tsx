@@ -5,6 +5,7 @@
 import type { Route } from './+types/catalog.changes';
 import { Link } from 'react-router';
 import { ArrowLeft, Minus, Pencil, Plus } from 'lucide-react';
+import { auditActionLabel } from '~/.server/audit';
 import { requireMember } from '~/.server/auth';
 import type { CatalogEntry } from '~/.server/catalog';
 import { catalogChangesFor, type CatalogVersionReason } from '~/.server/catalog/versions';
@@ -69,7 +70,7 @@ export async function loader({ request }: Route.LoaderArgs) {
       at: v.createdAt.toISOString(),
       /** 查看者看到的数据源相关原因统一为 sources，不暴露具体动作 */
       reason: v.reason,
-      reasonLabel: v.masked ? '数据源结构变化' : REASON_LABELS[v.reason as CatalogVersionReason] ?? v.reason,
+      reasonLabel: v.masked ? '数据源结构变化' : REASON_LABELS[v.reason as CatalogVersionReason] ?? auditActionLabel(v.reason) ?? v.reason,
       masked: v.masked,
       diff: v.diff,
     })),

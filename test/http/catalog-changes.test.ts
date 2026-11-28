@@ -1,6 +1,7 @@
 // test/http/catalog-changes.test.ts —— 目录变更记录的 HTTP 接缝（ADR-0041）：成员从数据地图页头进入 /catalog/changes，按版本倒序看到各版的原因与条目差异，?since=N 只看 N 之后的版本；
 // 查看者看不到 source: / table: 条目，数据源相关原因（含源视图发布与删除数据源）的版本只显示「数据源结构变化」、不列明细（ADR-0005）；还没有版本时显示空状态
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { CATALOG_ACTIONS } from '../../app/.server/catalog/tx';
 import { closeDb, getDb } from '../../app/.server/db/client';
 import { catalogVersions, sources, sourceTables, tasks } from '../../app/.server/db/schema';
 import { defaultSpaceOf, memberOf, newTenant } from '../pipeline/fixtures';
@@ -186,6 +187,35 @@ describe('目录变更记录', () => {
     expect(viewer).toContain('数据源结构变化');
     expect(viewer).not.toContain('openid');
     expect(viewer).not.toContain('不再列出');
+  });
+
+  it('CATALOG_ACTIONS 的每个动作都显示中文原因：REASON_LABELS 没有的知识动作回落到审计 label（#1333）', async () => {
+    const beta = await newTenant('beta');
+    const item = { id: 'entity:order', kind: 'entity' as const, name: '订单' };
+    const actions = [...CATALOG_ACTIONS];
+    await getDb().insert(catalogVersions).values(actions.map((reason, i) => ({
+      tenantId: beta, version: i + 1, snapshot: [], reason,
+      diff: { added: [], removed: [], changed: [{ ...item, keys: ['description'] }] },
+    })));
+
+    const admin = await (await (await loginAs(app, 'admin@beta.com')).get('/catalog/changes')).text();
+    const labels = new Map<string, string>();
+    for (const [i, action] of actions.entries()) {
+      // 版本倒序列出：一段从本版的 data-catalog-version 到小 1 的那一版为止，最老的一版（version 1 找不到 version 0）切到末尾；
+      // 原因文字是那一段里第一个 font-medium span
+      const version = i + 1;
+      const start = admin.indexOf(`data-catalog-version="${version}"`);
+      const next = admin.indexOf(`data-catalog-version="${version - 1}"`);
+      const section = admin.slice(start, next === -1 ? undefined : next);
+      const label = section.match(/<span class="font-medium">([^<]+)<\/span>/)?.[1] ?? '';
+      labels.set(action, label);
+      expect(label, action).not.toBe(action);
+      expect(label, action).toMatch(/[一-鿿]/);
+    }
+    expect(labels.get('semantic_claim.saved')).toBe('保存口径声明');
+    expect(labels.get('alias.added')).toBe('添加别名');
+    expect(labels.get('analysis_subject.renamed')).toBe('修改分析主题名');
+    expect(labels.get('term_default.set')).toBe('设置词的默认指向');
   });
 
   it('还没有任何版本时显示空状态', async () => {
