@@ -14,9 +14,9 @@ afterEach(() => { setLlmFetch(undefined); });
 const PROVIDER = { baseUrl: 'https://llm.example.com/v1', model: 'test-model', apiKey: 'sk-eval-secret', source: 'platform' as const };
 const caseNamed = (name: string) => KNOWLEDGE_IMPORT_GOLDEN.find(c => c.name === name)!;
 const alias = (targetId: string, value: string): ImportProposal =>
-  ({ kind: 'alias', targetId, alias: value, evidence: [{ paragraph: 1 }], reason: '段落写明' });
+  ({ kind: 'alias', targetId, alias: value, note: null, claim: null, evidence: [{ paragraph: 1 }], reason: '段落写明' });
 const claim = (targetId: string, type: string, value: string): ImportProposal =>
-  ({ kind: 'claim', targetId, claim: { type, value }, evidence: [{ paragraph: 1 }], reason: '段落写明' });
+  ({ kind: 'claim', targetId, claim: { type, value }, alias: null, note: null, evidence: [{ paragraph: 1 }], reason: '段落写明' });
 
 describe('知识导入黄金集', () => {
   it('至少 5 例，至少 2 例期望做不到；期望的目标都在固定目录里，claim 取值合法', () => {
