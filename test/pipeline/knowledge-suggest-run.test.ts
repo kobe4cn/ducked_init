@@ -5,8 +5,8 @@
 // + 写 knowledge_generations + 审计 knowledge_proposal.generated。
 // 同样的输入与生成器版本再点不调模型（fresh: false）；条目带上了待处理与已拒绝的提案时是另一个输入：再点真的调模型，
 // 同一批不再写入（#953）、提示词带 pending / rejected 与拒绝理由；拒绝过的提案不再出现（计 rejected）；
-// 模型失败（HTTP 错误，或缺 kind 对应字段不合 Schema，#956）422 并记 generate_failed 审计（不含提示词与输出原文）；
-// restricted 投影以外的内容不进提示词
+// 模型失败（HTTP 错误或输出不合 Schema）422 并记 generate_failed 审计（不含提示词与输出原文）；内容键为 null 的单条丢掉计 invalid、
+// 目标与原因进 dropped，不再整次 422（#1314）；restricted 投影以外的内容不进提示词
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tenantCatalog } from '../../app/.server/catalog/load';
@@ -39,13 +39,14 @@ const generations = (tenantId: string) => getDb().select().from(knowledgeGenerat
 const auditsOf = (tenantId: string, action: string) => getDb().select().from(auditLogs)
   .where(and(eq(auditLogs.tenantId, tenantId), eq(auditLogs.action, action)));
 
-/** 模型返回的一批提案：给主题条目 metric:paid_revenue 提别名 / 口径 / 说明，把邻接条目归入主题；坏条目按参数补在后面 */
+/** 模型返回的一批提案：给主题条目 metric:paid_revenue 提别名 / 口径 / 说明，把邻接条目归入主题；坏条目按参数补在后面。
+ *  三个内容键每条都给（与 kind 对应的填内容、其余 null）：SUGGEST_SCHEMA 的 required 含三个键，本地 Ajv 与模型共用这份 Schema */
 function modelOutput(bad: unknown[] = []) {
   return { proposals: [
-    { kind: 'alias', targetId: 'metric:paid_revenue', alias: '流水暗号', evidence: [{ ref: 'entity:order' }], reason: '常用叫法' },
-    { kind: 'claim', targetId: 'metric:paid_revenue', claim: { type: 'currency', value: 'CNY' }, evidence: [], reason: '币种' },
-    { kind: 'note', targetId: 'metric:paid_revenue', note: '只算实付金额', evidence: [{ ref: 'entity:order' }], reason: '口径说明' },
-    { kind: 'subject', targetId: 'entity:order', evidence: [{ ref: 'metric:paid_revenue' }], reason: '订单在主题里' },
+    { kind: 'alias', targetId: 'metric:paid_revenue', alias: '流水暗号', note: null, claim: null, evidence: [{ ref: 'entity:order' }], reason: '常用叫法' },
+    { kind: 'claim', targetId: 'metric:paid_revenue', alias: null, note: null, claim: { type: 'currency', value: 'CNY' }, evidence: [], reason: '币种' },
+    { kind: 'note', targetId: 'metric:paid_revenue', alias: null, note: '只算实付金额', claim: null, evidence: [{ ref: 'entity:order' }], reason: '口径说明' },
+    { kind: 'subject', targetId: 'entity:order', alias: null, note: null, claim: null, evidence: [{ ref: 'metric:paid_revenue' }], reason: '订单在主题里' },
     ...bad,
   ] };
 }
@@ -103,9 +104,9 @@ describe('按主题生成知识提案', () => {
     await addAlias(analyst, { targetId: 'metric:paid_revenue', alias: '流水暗号' });
     platformDefault();
     fakeLlm(setLlmFetch, () => json({ proposals: [
-      { kind: 'alias', targetId: 'metric:paid_revenue', alias: ' 流水暗号 ', evidence: [{ ref: 'entity:order' }], reason: '空白不同' },
-      { kind: 'claim', targetId: 'metric:paid_revenue', claim: { type: 'currency', value: 'CNY' }, evidence: [{ ref: 'entity:order' }], reason: '同值声明' },
-      { kind: 'claim', targetId: 'metric:paid_revenue', claim: { type: 'currency', value: 'USD' }, evidence: [{ ref: 'entity:order' }], reason: '取值不同' },
+      { kind: 'alias', targetId: 'metric:paid_revenue', alias: ' 流水暗号 ', note: null, claim: null, evidence: [{ ref: 'entity:order' }], reason: '空白不同' },
+      { kind: 'claim', targetId: 'metric:paid_revenue', alias: null, note: null, claim: { type: 'currency', value: 'CNY' }, evidence: [{ ref: 'entity:order' }], reason: '同值声明' },
+      { kind: 'claim', targetId: 'metric:paid_revenue', alias: null, note: null, claim: { type: 'currency', value: 'USD' }, evidence: [{ ref: 'entity:order' }], reason: '取值不同' },
     ] }, USAGE));
 
     const out = await suggestForSubject(analyst, subjectId);
@@ -137,7 +138,7 @@ describe('按主题生成知识提案', () => {
     const { acme, analyst, subjectId } = await setup();
     platformDefault();
     const { f } = fakeLlm(setLlmFetch, () => json({ proposals: [
-      { kind: 'subject', targetId: 'entity:order', evidence: [{ ref: 'metric:paid_revenue' }], reason: '订单在主题里' },
+      { kind: 'subject', targetId: 'entity:order', alias: null, note: null, claim: null, evidence: [{ ref: 'metric:paid_revenue' }], reason: '订单在主题里' },
     ] }, USAGE));
 
     const first = await suggestForSubject(analyst, subjectId);
@@ -183,7 +184,7 @@ describe('按主题生成知识提案', () => {
     const { acme, analyst, subjectId } = await setup();
     platformDefault();
     fakeLlm(setLlmFetch, n => json(n === 1 ? modelOutput() : { proposals: [
-      { kind: 'note', targetId: 'metric:paid_revenue', note: '实付金额，已扣除整单退款', evidence: [{ ref: 'entity:order' }], reason: '换个说法再提一次' },
+      { kind: 'note', targetId: 'metric:paid_revenue', alias: null, note: '实付金额，已扣除整单退款', claim: null, evidence: [{ ref: 'entity:order' }], reason: '换个说法再提一次' },
     ] }, USAGE));
 
     const first = await suggestForSubject(analyst, subjectId);
@@ -200,8 +201,8 @@ describe('按主题生成知识提案', () => {
     const { acme, analyst, subjectId } = await setup();
     platformDefault();
     const bad = [
-      { kind: 'alias', targetId: 'metric:paid_revenue', alias: '野路子', evidence: [{ ref: 'metric:nope' }], reason: '依据不在输入里' },
-      { kind: 'note', targetId: 'entity:nope', note: '不存在的条目', evidence: [], reason: '目标不在输入里' },
+      { kind: 'alias', targetId: 'metric:paid_revenue', alias: '野路子', note: null, claim: null, evidence: [{ ref: 'metric:nope' }], reason: '依据不在输入里' },
+      { kind: 'note', targetId: 'entity:nope', alias: null, note: '不存在的条目', claim: null, evidence: [], reason: '目标不在输入里' },
     ];
     fakeLlm(setLlmFetch, () => json(modelOutput(bad), USAGE));
     const invalid = await suggestForSubject(analyst, subjectId);
@@ -222,7 +223,7 @@ describe('按主题生成知识提案', () => {
     const { acme, analyst, subjectId } = await setup();
     platformDefault();
     const bad = Array.from({ length: 25 }, (_, i) => (
-      { kind: 'alias', targetId: `entity:nope${i}`, alias: `野名${i}`, evidence: [], reason: '目标不在主题条目里' }
+      { kind: 'alias', targetId: `entity:nope${i}`, alias: `野名${i}`, note: null, claim: null, evidence: [], reason: '目标不在主题条目里' }
     ));
     fakeLlm(setLlmFetch, () => json(modelOutput(bad), USAGE));
 
@@ -245,8 +246,8 @@ describe('按主题生成知识提案', () => {
       await saveDslDraft(analyst, 'metric', 'paid_revenue', REVENUE_V2);
       await publishDefinition(reviewer, 'metric', 'paid_revenue', 2);
       return json({ proposals: [
-        { kind: 'alias', targetId: 'metric:paid_revenue', alias: '营收合计', evidence: [{ ref: 'entity:order' }], reason: '依据已变' },
-        { kind: 'note', targetId: 'field:order.status', note: '退款单也算一笔订单', evidence: [], reason: '字段没有依据' },
+        { kind: 'alias', targetId: 'metric:paid_revenue', alias: '营收合计', note: null, claim: null, evidence: [{ ref: 'entity:order' }], reason: '依据已变' },
+        { kind: 'note', targetId: 'field:order.status', alias: null, note: '退款单也算一笔订单', claim: null, evidence: [], reason: '字段没有依据' },
       ] }, USAGE);
     });
     const stale = await suggestForSubject(analyst, subjectId);
@@ -257,22 +258,23 @@ describe('按主题生成知识提案', () => {
     expect(rows.map(r => [r.kind, r.targetId])).toEqual([['note', 'field:order.status']]);
   });
 
-  it('模型输出 kind:note 但没有 note（正文写进 reason）时不合 Schema：422、记 generate_failed 审计、不留提案与代次行', async () => {
+  it('模型输出 kind:note 但 note 为 null（正文写进 reason）时只丢这一条：其余照常落库、照常写代次行，dropped 记 note_invalid，不再整次 422', async () => {
     const { acme, analyst, subjectId } = await setup();
     platformDefault();
-    fakeLlm(setLlmFetch, () => json(modelOutput([
-      { kind: 'note', targetId: 'entity:order', evidence: [{ ref: 'entity:order' }], reason: '订单表存下单与支付信息' },
-    ]), USAGE));
+    fakeLlm(setLlmFetch, () => json({ proposals: [
+      { kind: 'note', targetId: 'metric:paid_revenue', alias: null, note: null, claim: null, evidence: [{ ref: 'entity:order' }], reason: '只算实付金额，正文写进了 reason' },
+      { kind: 'alias', targetId: 'metric:paid_revenue', alias: '流水暗号', note: null, claim: null, evidence: [{ ref: 'entity:order' }], reason: '常用叫法' },
+    ] }, USAGE));
 
-    const failure = (p: Promise<unknown>) => p.then(() => { throw new Error('应当失败'); }, (e: unknown) => e as SuggestError);
-    const e = await failure(suggestForSubject(analyst, subjectId));
-    expect(e).toBeInstanceOf(SuggestError);
-    expect(e).toMatchObject({ status: 422, message: expect.stringContaining('不符合 Schema') });
-    const [audit] = await auditsOf(acme, 'knowledge_proposal.generate_failed');
-    expect(audit).toMatchObject({ targetType: 'analysis_subject', targetId: subjectId,
-      detail: { subjectId, stage: 'model', error: expect.stringContaining('Schema') } });
-    expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme))).toHaveLength(0);
-    expect(await generations(acme)).toHaveLength(0);
+    const out = await suggestForSubject(analyst, subjectId);
+    expect(out).toEqual({ fresh: true, created: 1, existing: 0, rejected: 0, invalid: 1, stale: 0, skipped: 0 });
+    expect(await getDb().select().from(knowledgeProposals).where(eq(knowledgeProposals.tenantId, acme)))
+      .toEqual([expect.objectContaining({ kind: 'alias', targetId: 'metric:paid_revenue' })]);
+    // 缺内容的那条丢掉、目标与原因记进 generated 审计的 dropped；代次行照常写
+    const [audit] = await auditsOf(acme, 'knowledge_proposal.generated');
+    expect(audit!.detail).toMatchObject({ created: 1, invalid: 1, dropped: [{ targetId: 'metric:paid_revenue', reason: 'note_invalid' }] });
+    expect(await generations(acme)).toEqual([expect.objectContaining({ proposalCount: 1 })]);
+    expect(await auditsOf(acme, 'knowledge_proposal.generate_failed')).toHaveLength(0);
   });
 
   it('模型失败 422 并记 generate_failed 审计（不含提示词与输出原文），不留提案与代次行；查看者 403；未配置模型服务 409 且不发请求；主题不存在 400', async () => {

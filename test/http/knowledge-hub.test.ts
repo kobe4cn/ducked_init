@@ -44,12 +44,13 @@ const propose = (tenantId: string, input: Pick<ProposalInput, 'kind' | 'content'
   targetId: TARGET, evidence: [{ ref: TARGET, version: 1 }], generatorVersion: 'test-gen-1', ...input,
 })).then(p => p!);
 
-/** 模型替身返回的一批提案：给主题条目 metric:paid_revenue 提别名 / 口径 / 说明，把邻接条目 entity:order 归入主题（照 pipeline/knowledge-suggest-run 的写法） */
+/** 模型替身返回的一批提案：给主题条目 metric:paid_revenue 提别名 / 口径 / 说明，把邻接条目 entity:order 归入主题（照 pipeline/knowledge-suggest-run
+ *  的写法，三个内容键每条都给：与 kind 对应的填内容、其余 null——SUGGEST_SCHEMA 的 required 含三个键） */
 const modelOutput = () => ({ proposals: [
-  { kind: 'alias', targetId: TARGET, alias: '流水暗号', evidence: [{ ref: 'entity:order' }], reason: '常用叫法' },
-  { kind: 'claim', targetId: TARGET, claim: { type: 'currency', value: 'CNY' }, evidence: [], reason: '币种' },
-  { kind: 'note', targetId: TARGET, note: '只算实付金额', evidence: [{ ref: 'entity:order' }], reason: '口径说明' },
-  { kind: 'subject', targetId: 'entity:order', evidence: [{ ref: TARGET }], reason: '订单在主题里' },
+  { kind: 'alias', targetId: TARGET, alias: '流水暗号', note: null, claim: null, evidence: [{ ref: 'entity:order' }], reason: '常用叫法' },
+  { kind: 'claim', targetId: TARGET, alias: null, note: null, claim: { type: 'currency', value: 'CNY' }, evidence: [], reason: '币种' },
+  { kind: 'note', targetId: TARGET, alias: null, note: '只算实付金额', claim: null, evidence: [{ ref: 'entity:order' }], reason: '口径说明' },
+  { kind: 'subject', targetId: 'entity:order', alias: null, note: null, claim: null, evidence: [{ ref: TARGET }], reason: '订单在主题里' },
 ] });
 
 /** 身份打通数据源与订单映射，加一位分析师、一位查看者，发布指标 paid_revenue（sum(amount)，系统单位未知） */
